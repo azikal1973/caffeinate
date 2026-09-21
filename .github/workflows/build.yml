@@ -1,0 +1,46 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Arch Linux
+            image: archlinux:latest
+            setup: pacman -Syu --noconfirm --needed gcc make pkgconf dbus
+          - name: Debian stable
+            image: debian:stable
+            setup: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y gcc make pkg-config libdbus-1-dev
+          - name: Debian oldstable
+            image: debian:oldstable
+            setup: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y gcc make pkg-config libdbus-1-dev
+          - name: Ubuntu 22.04
+            image: ubuntu:22.04
+            setup: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y gcc make pkg-config libdbus-1-dev
+          - name: Fedora (clang)
+            image: fedora:latest
+            setup: dnf install -y clang make pkgconf-pkg-config dbus-devel
+            cc: clang
+          - name: Rocky Linux 8 (Kernel-Header 4.18)
+            image: rockylinux:8
+            setup: dnf install -y gcc make pkgconf-pkg-config dbus-devel
+          - name: openSUSE Tumbleweed
+            image: opensuse/tumbleweed:latest
+            setup: zypper -n install gcc make pkg-config dbus-1-devel
+          - name: Alpine (musl)
+            image: alpine:latest
+            setup: apk add --no-cache build-base pkgconf dbus-dev
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bauen und testen
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src ${{ matrix.image }} sh -c \
+            '${{ matrix.setup }} && make CC=${{ matrix.cc || 'cc' }} && make test'

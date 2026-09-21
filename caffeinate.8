@@ -1,0 +1,127 @@
+.TH CAFFEINATE 8 "September 2026" "caffeinate 0.1.0.0" "System Manager's Manual"
+.SH NAME
+caffeinate \- verhindert, dass das System im Auftrag eines Programms schlafen geht
+.SH SYNOPSIS
+.B caffeinate
+.RB [ \-disu ]
+.RB [ \-t
+.IR timeout ]
+.RB [ \-w
+.IR pid ]
+.RI [ command " " arguments ...]
+.SH BESCHREIBUNG
+Linux-Nachbau von
+.BR caffeinate (8)
+aus macOS. Parameter und Verhalten folgen Apples Quellcode.
+.PP
+.B caffeinate
+legt Sperren (Assertions) gegen Ruhezustand und Bildschirmschoner an. Ohne
+Assertion-Option wird
+.B \-i
+angenommen. Ist ein
+.I command
+angegeben, gelten die Sperren, solange es laeuft. Ohne command gelten sie,
+bis
+.B caffeinate
+endet: durch Strg+C, nach
+.B \-t
+oder mit dem Ende von
+.BR \-w .
+.SH OPTIONEN
+.TP
+.B \-d
+Verhindert, dass der Bildschirm abdunkelt, abschaltet oder sperrt.
+.TP
+.B \-i
+Verhindert den Ruhezustand bei Leerlauf. Der Bildschirm darf abschalten.
+.TP
+.B \-m
+Verhindert unter macOS, dass die Festplatte bei Leerlauf schlafen geht.
+Unter Linux gibt es kein Gegenstueck; die Option wird angenommen und ist
+ohne Wirkung.
+.TP
+.B \-s
+Verhindert jeden System-Sleep. Gilt nur am Netzteil; der Netzstatus wird
+alle 5 Sekunden geprueft.
+.TP
+.B \-u
+Meldet den Nutzer als aktiv (weckt den Bildschirm) und verhindert
+Bildschirmschlaf. Ohne
+.B \-t
+gilt diese Sperre 5 Sekunden;
+.B caffeinate
+selbst laeuft danach weiter, bis es beendet wird. Wie bei Apple gilt der
+Timeout auch fuer ein gleichzeitig angegebenes
+.BR \-m .
+.TP
+.BI \-t " timeout"
+Die Sperren enden nach
+.I timeout
+Sekunden. Ohne command endet dann auch
+.BR caffeinate .
+Mit command enden nur die Sperren, das command laeuft weiter.
+.B \-t 0
+bedeutet kein Timeout. Der Wert wird wie bei Apple mit
+.BR strtol (3)
+gelesen (auch 0x-Hex).
+.TP
+.BI \-w " pid"
+Die Sperren enden, sobald der Prozess
+.I pid
+beendet ist; gibt es ihn nicht, endet
+.B caffeinate
+sofort. Wird ignoriert, wenn ein command angegeben ist.
+.TP
+.B \-h
+Gibt die Usage aus.
+.SH COMMAND
+Wie bei Apple wird
+.B caffeinate
+selbst per exec zum command. PID, Exit-Status und Signale sind also die des
+commands, und Strg+C erreicht es direkt. Ein Hilfsprozess haelt die Sperren
+und endet mit dem command.
+.SH EXIT-STATUS
+Ohne command 0. Nach einem Signal (z. B. Strg+C) endet
+.B caffeinate
+an diesem Signal. Laesst sich eine Sperre nicht anlegen, erscheint
+.RI \(dqFailed\ to\ create\  Typ \ assertion\(dq
+und der Exit-Status ist 1. Bei einem ungueltigen Aufruf wird die Usage
+ausgegeben, Exit-Status 1. Mit command gilt dessen Exit-Status; ist es
+nicht zu finden, 127, sonst 126.
+.SH LINUX-UMSETZUNG
+.TP
+.B \-i
+org.freedesktop.PowerManagement.Inhibit (KDE, XFCE), sonst
+org.gnome.SessionManager bzw. org.mate.SessionManager (Flag suspend)
+.TP
+.BR \-d ", " \-u
+org.freedesktop.ScreenSaver.Inhibit, sonst Session-Manager (Flag idle);
+.B \-u
+ruft vorher SimulateUserActivity auf
+.TP
+.B \-s
+logind-Inhibitor
+.I sleep
+.PP
+Ohne Session-Bus (TTY, SSH) oder ohne passenden Desktop-Dienst wird der
+logind-Inhibitor
+.I idle
+verwendet. elogind funktioniert genauso. Alle Sperren enden mit dem
+Prozess, auch bei
+.BR "kill \-9" .
+.SH UMGEBUNG
+.TP
+.B CAFFEINATE_DEBUG
+Ist sie gesetzt (und nicht 0), wird jede Sperre auf stderr protokolliert.
+.SH BEISPIELE
+.TP
+.B caffeinate \-i make
+Kein Ruhezustand, solange make laeuft.
+.TP
+.B caffeinate \-d \-t 3600
+Bildschirm eine Stunde anlassen; Strg+C beendet vorher.
+.TP
+.B caffeinate \-w 4711
+Wach bleiben, bis Prozess 4711 endet.
+.SH SIEHE AUCH
+.BR systemd\-inhibit (1)
