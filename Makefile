@@ -1,16 +1,14 @@
-VERSION = 0.1.0.0
+VERSION = 0.2.0.0
 
 PREFIX  ?= $(HOME)/.local
 BINDIR  ?= $(PREFIX)/bin
 MANDIR  ?= $(PREFIX)/share/man/man8
 
 CC      ?= cc
-PKG_CONFIG ?= pkg-config
 CFLAGS  ?= -O2 -g
 
 # override: auch bei CFLAGS=... von der Kommandozeile (Distro-Pakete, asan)
-override CFLAGS += -std=c11 -Wall -Wextra -Wpedantic $(shell $(PKG_CONFIG) --cflags dbus-1)
-override LDLIBS += $(shell $(PKG_CONFIG) --libs dbus-1)
+override CFLAGS += -std=c11 -Wall -Wextra -Wpedantic
 
 all: caffeinate
 
@@ -23,8 +21,13 @@ asan:
 	$(MAKE) -B caffeinate CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
 		LDFLAGS="-fsanitize=address,undefined"
 
+# ein Binary fuer jede Distribution; braucht die statische libc (musl oder glibc-static)
+static:
+	$(MAKE) -B caffeinate CFLAGS="-O2" LDFLAGS="-static -s"
+
 test: caffeinate
 	sh tests/smoke.sh ./caffeinate
+	sh tests/dbus.sh ./caffeinate
 
 install: caffeinate
 	install -Dm755 caffeinate $(DESTDIR)$(BINDIR)/caffeinate
@@ -36,4 +39,4 @@ uninstall:
 clean:
 	rm -f caffeinate
 
-.PHONY: all asan test install uninstall clean
+.PHONY: all asan static test install uninstall clean

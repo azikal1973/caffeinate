@@ -1,4 +1,4 @@
-.TH CAFFEINATE 8 "September 2026" "caffeinate 0.1.0.0" "System Manager's Manual"
+.TH CAFFEINATE 8 "Oktober 2026" "caffeinate 0.2.0.0" "System Manager's Manual"
 .SH NAME
 caffeinate \- verhindert, dass das System im Auftrag eines Programms schlafen geht
 .SH SYNOPSIS
@@ -83,9 +83,10 @@ und endet mit dem command.
 .SH EXIT-STATUS
 Ohne command 0. Nach einem Signal (z. B. Strg+C) endet
 .B caffeinate
-an diesem Signal. Laesst sich eine Sperre nicht anlegen, erscheint
-.RI \(dqFailed\ to\ create\  Typ \ assertion\(dq
-und der Exit-Status ist 1. Bei einem ungueltigen Aufruf wird die Usage
+an diesem Signal. Laesst sich eine Sperre nicht anlegen, erscheinen der
+Grund und
+.RI \(dqFailed\ to\ create\  Typ \ assertion\(dq ,
+der Exit-Status ist 1. Bei einem ungueltigen Aufruf wird die Usage
 ausgegeben, Exit-Status 1. Mit command gilt dessen Exit-Status; ist es
 nicht zu finden, 127, sonst 126.
 .SH LINUX-UMSETZUNG
@@ -95,24 +96,50 @@ org.freedesktop.PowerManagement.Inhibit (KDE, XFCE), sonst
 org.gnome.SessionManager bzw. org.mate.SessionManager (Flag suspend)
 .TP
 .BR \-d ", " \-u
-org.freedesktop.ScreenSaver.Inhibit, sonst Session-Manager (Flag idle);
+org.freedesktop.ScreenSaver.Inhibit, sonst org.xfce.ScreenSaver oder
+Session-Manager (Flag idle);
 .B \-u
 ruft vorher SimulateUserActivity auf
 .TP
 .B \-s
 logind-Inhibitor
-.I sleep
+.IR sleep .
+Am Netz ist der Rechner, wenn eine Stromquelle online meldet oder kein
+Akku entlaedt. Die Sperre braucht die Erlaubnis von logind (polkit); ohne
+lokale Sitzung, etwa ueber SSH, haben sie in der Standardeinstellung nur
+Administratoren.
 .PP
 Ohne Session-Bus (TTY, SSH) oder ohne passenden Desktop-Dienst wird der
 logind-Inhibitor
 .I idle
-verwendet. elogind funktioniert genauso. Alle Sperren enden mit dem
-Prozess, auch bei
+verwendet. elogind funktioniert genauso, ohne beide wird ConsoleKit2
+versucht. Alle Sperren enden mit dem Prozess, auch bei
 .BR "kill \-9" .
+.PP
+Startet ein Desktop-Dienst neu, legt
+.B caffeinate
+die Sperre dort neu an. Solange der Dienst fehlt, haelt logind eine
+Ersatzsperre.
+.PP
+D-Bus wird direkt auf dem Socket gesprochen; ausser der libc wird keine
+Bibliothek gebraucht.
 .SH UMGEBUNG
 .TP
 .B CAFFEINATE_DEBUG
 Ist sie gesetzt (und nicht 0), wird jede Sperre auf stderr protokolliert.
+.TP
+.B DBUS_SESSION_BUS_ADDRESS
+Adresse des Session-Busses. Fehlt sie oder ist der Bus dort nicht
+erreichbar, wird
+.IB $XDG_RUNTIME_DIR /bus
+versucht, ohne
+.B XDG_RUNTIME_DIR
+.IR /run/user/ UID /bus .
+Genutzt werden nur Unix-Sockets.
+.TP
+.B DBUS_SYSTEM_BUS_ADDRESS
+Adresse des System-Busses statt
+.IR /run/dbus/system_bus_socket .
 .SH BEISPIELE
 .TP
 .B caffeinate \-i make
