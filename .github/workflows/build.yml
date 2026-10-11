@@ -12,8 +12,10 @@ permissions:
 jobs:
   # Bauen und testen mit dem Compiler und der libc der jeweiligen Distribution.
   # dbus-daemon und PyGObject sind fuer tests/dbus.sh, Xvfb fuer tests/x11.sh.
-  # --privileged erlaubt die Netzteil-Tests (Mount-Namespace); der Container
-  # laeuft auf einem Wegwerf-Runner, auf dem der Job ohnehin alles darf.
+  # --privileged erlaubt die Netzteil-Tests (Mount-Namespace). Das gibt fremdem
+  # Code aus einem Pull-Request nichts, was er nicht schon haette: Er kann auch
+  # diesen Workflow aendern, laeuft auf einem Wegwerf-Runner und bekommt nur
+  # das lesende Token.
   build:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest

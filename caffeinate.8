@@ -100,8 +100,8 @@ org.gnome.SessionManager (GNOME, Cinnamon, MATE; Flag suspend). Unter XFCE
 haelt diese Sperre auch den Bildschirm an.
 .TP
 .BR \-d ", " \-u
-org.freedesktop.ScreenSaver.Inhibit, unter XFCE xfce4-power-manager (ohne
-ihn org.xfce.ScreenSaver), sonst org.gnome.SessionManager (Flag idle);
+unter XFCE xfce4-power-manager, sonst org.freedesktop.ScreenSaver.Inhibit,
+org.xfce.ScreenSaver oder org.gnome.SessionManager (Flag idle);
 .B \-u
 ruft vorher SimulateUserActivity auf
 .TP
@@ -129,7 +129,8 @@ zusaetzlich den Bildschirmschoner und DPMS des X-Servers aus (Erweiterung
 MIT-SCREEN-SAVER), solange die Sperre gilt. Das wirkt auch ohne jeden
 Desktop-Dienst, etwa unter i3 oder dwm, und auf Programme, die dem
 Bildschirmschoner des Servers folgen (xss-lock). Programme, die die
-Leerlaufzeit selbst messen (xautolock, xidlehook), bemerken davon nichts.
+Leerlaufzeit selbst messen (xautolock, xidlehook, xscreensaver), bemerken
+davon nichts.
 .B \-u
 beendet ausserdem einen laufenden Bildschirmschoner und schaltet den
 Bildschirm ein. Unter Wayland wird der X-Server nicht benutzt.
@@ -138,7 +139,9 @@ Startet ein Desktop-Dienst neu, legt
 .B caffeinate
 die Sperre dort neu an. Solange der Dienst fehlt, haelt logind eine
 Ersatzsperre. Laesst sich eine verlorene Sperre nirgends ersetzen, steht
-das einmal auf stderr.
+das auf stderr;
+.B caffeinate
+versucht es dann jede Minute erneut und meldet, wenn sie wieder da ist.
 .PP
 D-Bus wird direkt auf dem Socket gesprochen; ausser der libc wird keine
 Bibliothek gebraucht.

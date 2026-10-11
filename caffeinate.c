@@ -87,6 +87,7 @@
 #define CALL_TIMEOUT_MS 5000
 #define SETTLE_MS       500	/* neu gestarteter Dienst: warten, bis er Aufrufe annimmt */
 #define RETRY_MS        5000	/* ... und einmal nachfassen, falls er dann noch nicht so weit war */
+#define LOST_RETRY_MS   60000	/* ganz ohne Sperre: so oft neu versuchen */
 #define FOREVER         (-1LL)
 #define MAX_TIMEOUT_S   3155760000UL	/* 100 Jahre; mehr gilt als unendlich */
 
@@ -122,14 +123,15 @@ struct backend {
 #define GNOME_SM    "org.gnome.SessionManager", "/org/gnome/SessionManager", "org.gnome.SessionManager", "Uninhibit"
 
 /*
- * XFCE: xfce4-power-manager schaltet per DPMS ab und haelt, solange es
- * gesperrt ist, auch den Bildschirmschoner an. org.xfce.ScreenSaver allein
- * liesse DPMS laufen und zaehlt deshalb nur, wenn der Power-Manager fehlt.
+ * Reihenfolge = Vorrang. XFCE zuerst: xfce4-power-manager schaltet per DPMS
+ * ab und haelt, solange es gesperrt ist, auch den Bildschirmschoner an (ob
+ * xfce4-screensaver oder light-locker). Deren eigene Sperre liesse DPMS und
+ * den Leerlauf-Ruhezustand laufen und zaehlt nur, wenn der Power-Manager fehlt.
  */
 static const struct backend display_backends[] = {
+	{ "org.xfce.PowerManager", PM_INHIBIT, 0 },
 	{ FDO_SS, "/org/freedesktop/ScreenSaver", FDO_SS, "UnInhibit", 0 },
 	{ FDO_SS, "/ScreenSaver", FDO_SS, "UnInhibit", 0 },	/* manche Dienste kennen nur diesen Pfad */
-	{ "org.xfce.PowerManager", PM_INHIBIT, 0 },
 	{ XFCE_SS, "/org/xfce/ScreenSaver", XFCE_SS, "UnInhibit", 0 },
 	{ GNOME_SM, GSM_IDLE },
 	{ NULL, NULL, NULL, NULL, 0 }
@@ -165,6 +167,11 @@ struct assertion {
 static struct assertion as[A_COUNT];
 static long long refresh_at = FOREVER;	/* wann stale-Sperren neu angelegt werden */
 static bool retry;			/* danach noch einmal nachfassen */
+static unsigned owner_changes;		/* wie oft einer Sperre ihr Dienst abhanden kam */
+static const char *inflight_dest;	/* Dienst, bei dem gerade ein Inhibit laeuft, ... */
+static char inflight_owner[64];		/* ... sein neuer Besitzer, falls der Name dabei gewandert ist */
+static bool inflight_hit;
+static char last_sender[64];		/* Absender der letzten Antwort (eindeutiger Busname) */
 static char details[160];
 static char reason[256];		/* warum der letzte Aufruf scheiterte */
 static enum { E_OTHER, E_ABSENT, E_DENIED } failure;	/* ... und auf welche Art */
@@ -350,7 +357,7 @@ struct out {
 	bool overflow;
 };
 
-static void name_changed(const char *name);
+static void name_changed(const char *name, const char *new_owner);
 
 static uint32_t rd32(const unsigned char *p, bool big)
 {
@@ -681,6 +688,9 @@ static int bus_next(struct bus *b, long long deadline, struct message *m)
 			b->skip -= b->have;
 			b->have = 0;
 			bus_drop_fds(b);
+			/* auch ein ununterbrochener Strom haelt den Aufrufer nicht ueber die Frist hinaus fest */
+			if (b->skip && now_ms() >= deadline)
+				return 0;
 			continue;
 		}
 		if (b->have < 16) {
@@ -745,13 +755,15 @@ static const char *body_str(const struct message *m, size_t *off)
 static void bus_other(struct bus *b, const struct message *m)
 {
 	size_t off = 0;
-	const char *name;
+	const char *name, *new_owner;
 
+	/* NameOwnerChanged(Name, alter Besitzer, neuer Besitzer) */
 	if (b == &user_bus && m->type == M_SIGNAL &&
 	    m->sender && !strcmp(m->sender, DBUS_NAME) &&
 	    m->member && !strcmp(m->member, "NameOwnerChanged") &&
-	    m->sig && !strncmp(m->sig, "sss", 3) && (name = body_str(m, &off)))
-		name_changed(name);
+	    m->sig && !strncmp(m->sig, "sss", 3) &&
+	    (name = body_str(m, &off)) && body_str(m, &off) && (new_owner = body_str(m, &off)))
+		name_changed(name, new_owner);
 	bus_drop_fds(b);
 }
 
@@ -825,6 +837,8 @@ static bool call(struct bus *b, bool autostart, const char *dest, const char *pa
 	}
 
 	bool ok = m.type == M_RETURN;
+
+	snprintf(last_sender, sizeof last_sender, "%s", m.sender ? m.sender : "");
 
 	if (!ok) {
 		size_t off = 0;
@@ -1119,29 +1133,37 @@ static int logind_inhibit(const char *what)
 	return -1;
 }
 
-/* Erstes laufende Desktop-Backend der Liste nehmen. */
-static bool sess_inhibit(const struct backend *list, struct assertion *a)
+/* Erstes laufende Desktop-Backend der Liste nehmen; stop: nur die davor (NULL = alle). */
+static bool sess_inhibit(const struct backend *list, const struct backend *stop, struct assertion *a)
 {
 	struct bus *b = get_user_bus();
-	uint32_t xid = 0;
+	uint32_t xid = 0, cookie;
 
-	for (const struct backend *be = list; b && be->dest; be++) {
+	for (const struct backend *be = list; b && be->dest && be != stop; be++) {
 		bool ok;
 
+		inflight_dest = be->dest;
+		inflight_hit = false;
 		if (be->gsm_flags)
-			ok = call(b, false, be->dest, be->path, be->iface, "Inhibit", 'u', &a->cookie,
+			ok = call(b, false, be->dest, be->path, be->iface, "Inhibit", 'u', &cookie,
 			          "susu", NAME, xid, details, be->gsm_flags);
 		else
-			ok = call(b, false, be->dest, be->path, be->iface, "Inhibit", 'u', &a->cookie,
+			ok = call(b, false, be->dest, be->path, be->iface, "Inhibit", 'u', &cookie,
 			          "ss", NAME, details);
-		if (ok) {
-			a->be = be;
-			/* Besitzerwechsel, die waehrend des Aufrufs gemeldet wurden, sind
-			 * aelter als diese Antwort: die Sperre gilt beim jetzigen Besitzer */
-			a->stale = false;
-			DBG("%s.Inhibit -> cookie %u", be->iface, a->cookie);
-			return true;
+		inflight_dest = NULL;
+		if (!ok)
+			continue;
+		if (inflight_hit && strcmp(inflight_owner, last_sender) != 0) {
+			/* Der Name ist waehrend des Aufrufs weitergewandert: Die Zusage
+			 * stammt nicht vom jetzigen Besitzer. Sie verfaellt mit unserer
+			 * Verbindung; name_changed() hat das Neuanlegen schon geplant. */
+			DBG("%s: Besitzer hat waehrend des Aufrufs gewechselt", be->dest);
+			continue;
 		}
+		a->be = be;
+		a->cookie = cookie;
+		DBG("%s.Inhibit -> cookie %u", be->iface, a->cookie);
+		return true;
 	}
 	return false;
 }
@@ -1317,7 +1339,7 @@ static bool x11_setup(int fd, const char *num, bool wake)
 	/* Antwort: Status, dann Zusatzdaten in 4-Byte-Einheiten (bei Erfolg die Beschreibung des Servers) */
 	if (!send_all(fd, setup, len, x.deadline) || !recv_all(fd, pkt, 8, x.deadline) ||
 	    !recv_all(fd, NULL, (size_t)(pkt[6] | pkt[7] << 8) * 4, x.deadline) || pkt[0] != 1) {
-		DBG("X11: Display :%s lehnt die Verbindung ab", num);
+		DBG("X11: Display :%s antwortet nicht oder lehnt die Verbindung ab", num);
 		return false;
 	}
 
@@ -1406,7 +1428,9 @@ static void x11_drain(struct assertion *a)
 	a->xfd = -1;
 	if (!a->be && a->fd < 0 && !a->lost) {
 		fprintf(stderr, NAME ": %s: Sperre verloren: X-Server beendet\n", type_name[a - as]);
-		a->lost = true;
+		a->lost = a->stale = true;
+		if (refresh_at == FOREVER)
+			refresh_at = now_ms() + LOST_RETRY_MS;
 	}
 }
 
@@ -1538,7 +1562,7 @@ static bool create_one(int type, bool first)
 			a->xfd = x11_suspend(type == A_USER);
 		/* fall through */
 	case A_IDLE:
-		if (sess_inhibit(backends_for(type), a))
+		if (sess_inhibit(backends_for(type), NULL, a))
 			return true;
 		a->fd = logind_inhibit("idle");
 		return a->fd >= 0 || a->xfd >= 0;
@@ -1605,27 +1629,31 @@ static bool create_assertions(const bool want[A_COUNT], long timeout)
 
 /*
  * Der Besitzer eines Dienstnamens hat gewechselt: Der Dienst ist beendet
- * oder (neu) gestartet. Eine Sperre bei ihm ist damit weg; eine
- * Ersatzsperre bei logind kann jetzt ggf. zum Dienst wechseln.
+ * (new_owner leer) oder (neu) gestartet. Eine Sperre bei ihm ist damit weg.
+ * Kommt ein Dienst, der in der Liste vor dem jetzigen steht - oder
+ * ueberhaupt einer, solange nur die Ersatzsperre haelt -, wird gewechselt.
  */
-static void name_changed(const char *name)
+static void name_changed(const char *name, const char *new_owner)
 {
+	if (inflight_dest && !strcmp(name, inflight_dest)) {
+		inflight_hit = true;
+		snprintf(inflight_owner, sizeof inflight_owner, "%s", new_owner);
+	}
 	for (int i = 0; i < A_COUNT; i++) {
 		struct assertion *a = &as[i];
 		const struct backend *be = backends_for(i);
 
 		if (!a->active || !be)
 			continue;
-		if (a->be) {
-			if (strcmp(a->be->dest, name) != 0)
-				continue;
+		if (a->be && !strcmp(a->be->dest, name)) {
 			/* das Cookie gehoert dem alten Besitzer; beim neuen koennte
 			 * dieselbe Nummer die Sperre eines anderen Programms sein */
 			a->be = NULL;
+			owner_changes++;
 		} else {
-			while (be->dest && strcmp(be->dest, name) != 0)
+			while (be->dest && be != a->be && strcmp(be->dest, name) != 0)
 				be++;
-			if (!be->dest)
+			if (!*new_owner || !be->dest || be == a->be)
 				continue;
 		}
 		DBG("%s: Besitzer von %s hat gewechselt", type_name[i], name);
@@ -1638,36 +1666,61 @@ static void name_changed(const char *name)
 /* Aufrufer hat refresh_at zurueckgesetzt; kommt waehrenddessen ein Signal, plant name_changed() neu */
 static void refresh_assertions(void)
 {
-	bool follow_up = retry, again = false;
+	bool follow_up = retry, again = false, lost = false;
 
 	retry = false;
 	for (int i = 0; i < A_COUNT; i++) {
-		struct assertion *a = &as[i];
-		int old_fd = a->fd;
+		/* fehlt eine Sperre ganz, duerfen es auch abgerissene Busverbindungen noch einmal versuchen */
+		if (as[i].active && as[i].lost) {
+			if (user_bus.fd < 0)
+				user_bus.tried = false;
+			if (sys_bus.fd < 0)
+				sys_bus.tried = false;
+		}
+	}
+	for (int i = 0; i < A_COUNT; i++) {
+		struct assertion *a = &as[i], old = as[i];
 
 		if (!a->active || !a->stale)
 			continue;
 		a->stale = false;
+		if (old.be) {
+			/* Ein Dienst weiter vorn in der Liste ist gekommen: erst dort
+			 * sperren, dann die bisherige Sperre aufgeben - es sei denn, deren
+			 * Dienst hat inzwischen gewechselt, dann gibt es sie nicht mehr. */
+			unsigned before = owner_changes;
+
+			if (sess_inhibit(backends_for(i), old.be, a) && before == owner_changes)
+				sess_uninhibit(&old);
+			continue;
+		}
 		create_one(i, false);
 		if (a->be || a->fd >= 0) {
 			/* Ersatzsperre erst jetzt freigeben, damit keine Luecke entsteht */
-			if (old_fd >= 0)
-				close(old_fd);
+			if (old.fd >= 0)
+				close(old.fd);
+			if (a->lost)
+				fprintf(stderr, NAME ": %s: Sperre wieder angelegt\n", type_name[i]);
 			a->lost = false;
 		} else {
 			/* nichts Neues bekommen: die alte Ersatzsperre gilt weiter */
-			a->fd = old_fd;
-			if (old_fd < 0 && a->xfd < 0 && !a->lost) {
-				fprintf(stderr, NAME ": %s: Sperre verloren%s%s\n", type_name[i],
-				        *reason ? ": " : "", reason);
-				a->lost = true;
+			a->fd = old.fd;
+			if (old.fd < 0 && a->xfd < 0) {
+				/* ganz ohne Sperre: melden, sobald auch das Nachfassen nichts
+				 * gebracht hat, und es in groesseren Abstaenden weiter versuchen */
+				if (!follow_up && !a->lost) {
+					fprintf(stderr, NAME ": %s: Sperre verloren%s%s\n", type_name[i],
+					        *reason ? ": " : "", reason);
+					a->lost = true;
+				}
+				a->stale = lost = true;
 			}
 		}
 		if (!a->be && follow_up)
 			a->stale = again = true;
 	}
-	if (again && refresh_at == FOREVER)
-		refresh_at = now_ms() + RETRY_MS;
+	if (refresh_at == FOREVER && (again || lost))
+		refresh_at = now_ms() + (again ? RETRY_MS : LOST_RETRY_MS);
 }
 
 /* Der Session-Bus ist weg (abgemeldet): Die Sperren dort gibt es nicht mehr */
@@ -1806,6 +1859,7 @@ int main(int argc, char **argv)
 	watch_signal(&mask, SIGHUP);
 
 	int pfd = -1;		/* Prozess, auf dessen Ende gewartet wird */
+	int death_sig = 0;	/* mit command ohne pidfd: Signal beim Tod des Elternprozesses */
 	pid_t pid_poll = 0;	/* -w ohne pidfd: per kill(pid, 0) abfragen */
 	long long deadline = FOREVER;
 	bool have_cmd = argc - optind > 0;
@@ -1837,9 +1891,15 @@ int main(int argc, char **argv)
 		pfd = close_inherited_fds(self_fd);
 		signal(SIGINT, SIG_IGN);
 		signal(SIGQUIT, SIG_IGN);
+		if (pfd < 0) {
+			/* kein pidfd (Kernel < 5.3): Signal beim Tod des Elternprozesses.
+			 * Ein eigenes, denn SIGTERM kann ignoriert sein (nohup, trap). */
+			death_sig = SIGUSR1;
+			sigaddset(&mask, death_sig);
+		}
 		sigprocmask(SIG_BLOCK, &mask, &oldmask);
-		if (pfd < 0)	/* kein pidfd (Kernel < 5.3): Signal beim Tod des Elternprozesses */
-			prctl(PR_SET_PDEATHSIG, SIGTERM);
+		if (death_sig)
+			prctl(PR_SET_PDEATHSIG, death_sig);
 		if (getppid() != parent)
 			return EXIT_SUCCESS;
 		snprintf(details, sizeof details,
@@ -1889,8 +1949,6 @@ int main(int argc, char **argv)
 	for (;;) {
 		if (user_bus.fd >= 0)
 			sess_dispatch();
-		else
-			sess_gone();	/* der Bus kann auch mitten in einem Aufruf gestorben sein */
 		if (refresh_at != FOREVER && refresh_at <= now_ms()) {
 			refresh_at = FOREVER;
 			refresh_assertions();
@@ -1921,6 +1979,9 @@ int main(int argc, char **argv)
 			if (next == FOREVER || now + PID_POLL_MS < next)
 				next = now + PID_POLL_MS;
 		}
+		/* der Session-Bus kann in jedem der Aufrufe oben gestorben sein */
+		if (user_bus.fd < 0)
+			sess_gone();
 		if (refresh_at != FOREVER && (next == FOREVER || refresh_at < next))
 			next = refresh_at;
 
@@ -1946,7 +2007,8 @@ int main(int argc, char **argv)
 		if (p[0].revents & POLLIN) {
 			struct signalfd_siginfo si;
 			if (read(sfd, &si, sizeof si) == sizeof si) {
-				term_sig = (int)si.ssi_signo;
+				if ((int)si.ssi_signo != death_sig)
+					term_sig = (int)si.ssi_signo;
 				break;
 			}
 		}

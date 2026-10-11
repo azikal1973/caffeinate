@@ -208,6 +208,24 @@ m=$mock_pid
 has "XFCE ohne Power-Manager -d: xfce4-screensaver" "^xfss /org/xfce/ScreenSaver Inhibit cookie=[0-9]* app=caffeinate "
 stop "$m"
 
+# xfce4-power-manager startet erst nach caffeinate: Die Sperre wechselt dorthin
+: > "$LOG"
+mock session xfss
+m=$mock_pid
+"$C" -d &
+cpid=$!
+pids="$pids $cpid"
+has "XFCE, Power-Manager kommt spaeter: zunaechst xfce4-screensaver" "^xfss .* Inhibit cookie=1 "
+mock session xfpm
+m2=$mock_pid
+has "XFCE, Power-Manager kommt spaeter: Sperre wechselt dorthin" "^xfpm .* Inhibit "
+has "XFCE, Power-Manager kommt spaeter: die alte wird freigegeben" "^xfss .* UnInhibit 1\$"
+kill -TERM "$cpid"
+wait "$cpid"
+has "XFCE, Power-Manager kommt spaeter: Freigabe am Ende" "^xfpm .* UnInhibit "
+stop "$m"
+stop "$m2"
+
 # ---------------------------------------------------------------- GNOME, Cinnamon, MATE
 # alle drei melden ihren Session-Manager als org.gnome.SessionManager
 : > "$LOG"
@@ -419,6 +437,33 @@ sleep 1
 hasnt "fremde fds vor der Antwort: Sperre haelt, solange caffeinate laeuft" "^login1 released"
 wait "$cpid"
 has "fremde fds vor der Antwort: am Ende freigegeben" "^login1 released idle\$"
+stop "$m"
+
+# Dienst weg und nichts als Ersatz: gemeldet wird erst, wenn auch das
+# Nachfassen nach 5 s nichts gebracht hat, und wieder, wenn die Sperre zurueck ist
+: > "$LOG"
+mock session pm
+m=$mock_pid
+"$C" -i 2> "$T/err" &
+cpid=$!
+pids="$pids $cpid"
+has "Sperre verloren: zunaechst beim Dienst" "^pm .* Inhibit "
+stop "$m"
+sleep 2
+check "Sperre verloren: noch keine Meldung vor dem Nachfassen" "" "$(cat "$T/err")"
+i=0
+while [ ! -s "$T/err" ] && [ "$i" -lt 60 ]; do
+	i=$((i + 1))
+	sleep 0.1
+done
+check "Sperre verloren: Meldung" "caffeinate: PreventUserIdleSystemSleep: Sperre verloren: weder logind noch elogind oder ConsoleKit2 am System-Bus" "$(cat "$T/err")"
+mock session pm
+m=$mock_pid
+has "Sperre verloren: Dienst wieder da, neue Sperre" "^pm .* Inhibit " 2
+sleep 0.3
+check "Sperre verloren: Meldung, dass sie wieder da ist" "caffeinate: PreventUserIdleSystemSleep: Sperre wieder angelegt" "$(tail -n 1 "$T/err")"
+kill -TERM "$cpid"
+wait "$cpid" 2>/dev/null
 stop "$m"
 
 # ---------------------------------------------------------------- ConsoleKit2, gar nichts

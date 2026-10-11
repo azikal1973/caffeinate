@@ -6,15 +6,16 @@ MANDIR  ?= $(PREFIX)/share/man/man8
 
 CC      ?= cc
 
-# Haertung, soweit der Compiler sie kennt. Wer CFLAGS und LDFLAGS selbst setzt
-# (Distro-Pakete), bringt seine eigene mit. _FORTIFY_SOURCE setzt caffeinate.c.
-HARDEN  := $(shell for f in -fstack-protector-strong -fPIE; do \
-		$(CC) $$f -E -x c /dev/null >/dev/null 2>&1 && printf '%s ' $$f; done)
+# Haertung als Vorgabe. Wer CFLAGS und LDFLAGS selbst setzt (Distro-Pakete),
+# bringt seine eigene mit. _FORTIFY_SOURCE setzt caffeinate.c.
+# -fstack-protector-strong kennt gcc erst ab 4.9, deshalb die Probe.
+HARDEN   = $(shell $(CC) -fstack-protector-strong -E -x c /dev/null >/dev/null 2>&1 && echo -fstack-protector-strong)
 CFLAGS  ?= -O2 -g $(HARDEN)
 LDFLAGS ?= -pie -Wl,-z,relro,-z,now
 
-# override: auch bei CFLAGS=... von der Kommandozeile (Distro-Pakete, asan)
-override CFLAGS += -std=c11 -Wall -Wextra -Wpedantic
+# override: auch bei CFLAGS=... von der Kommandozeile (Distro-Pakete, asan).
+# -fPIE gehoert zu -pie, auch wenn nur CFLAGS ersetzt wurden.
+override CFLAGS += -std=c11 -Wall -Wextra -Wpedantic $(if $(filter -pie -static-pie,$(LDFLAGS)),-fPIE)
 
 all: caffeinate
 

@@ -63,8 +63,8 @@ Mit glibc statisch gelinkt, verlangt das Binary mindestens den Kernel, für den 
 Distribution gebaut wurde. Mit musl gibt es diese Grenze nicht, deshalb entstehen die Binaries der
 Releases unter Alpine.
 
-Gebaut wird mit Stack-Protector, PIE, vollem RELRO und `_FORTIFY_SOURCE`, soweit der Compiler das
-kennt. Wer `CFLAGS` und `LDFLAGS` selbst setzt (Distro-Pakete), bestimmt das selbst.
+Gebaut wird mit PIE, vollem RELRO, `_FORTIFY_SOURCE` und, wo der Compiler ihn kennt, dem
+Stack-Protector. Wer `CFLAGS` und `LDFLAGS` selbst setzt (Distro-Pakete), bestimmt das selbst.
 
 ### NixOS
 
@@ -115,13 +115,14 @@ In einer X11-Sitzung setzen `-d` und `-u` zusätzlich den Bildschirmschoner und 
 (Erweiterung MIT-SCREEN-SAVER). Das wirkt auch ganz ohne Desktop-Dienst, etwa unter i3, dwm oder bspwm,
 und endet mit der Sperre. `-u` beendet dabei einen laufenden Bildschirmschoner und schaltet den
 Bildschirm ein. Programme, die dem Bildschirmschoner des Servers folgen (xss-lock), bleiben damit
-ebenfalls ruhig. Programme, die die Leerlaufzeit selbst messen (xautolock, xidlehook), bemerken davon
-nichts. Unter Wayland wird der X-Server nicht benutzt.
+ebenfalls ruhig. Programme, die die Leerlaufzeit selbst messen (xautolock, xidlehook, xscreensaver),
+bemerken davon nichts. Unter Wayland wird der X-Server nicht benutzt.
 
 Startet ein Desktop-Dienst neu (etwa PowerDevil nach einem Absturz), ist die Sperre dort verloren.
 caffeinate bemerkt das und legt sie neu an. Solange der Dienst fehlt, hält logind eine Ersatzsperre.
 Dasselbe gilt, wenn der Dienst erst nach caffeinate startet oder der Session-Bus endet. Lässt sich
-eine verlorene Sperre nirgends ersetzen, meldet caffeinate das einmal auf stderr und läuft weiter.
+eine verlorene Sperre nirgends ersetzen, meldet caffeinate das auf stderr, läuft weiter, versucht es
+jede Minute erneut und meldet auch, wenn die Sperre wieder da ist.
 
 Ob der Rechner am Netz hängt, entscheidet `-s` wie systemd: Eine Stromquelle meldet `online`, oder
 kein Akku entlädt sich. Ein USB-C-Port, der selbst ein Gerät speist, zählt nicht als Stromquelle. Der
@@ -150,8 +151,8 @@ Wo Apples Manpage und Apples Code sich widersprechen, folgt dieser Nachbau dem C
 | Umgebung | Status |
 |---|---|
 | KDE Plasma | getestet; PowerDevil setzt eine Sperre erst 5 s nach der Anforderung durch |
-| GNOME, Cinnamon, MATE | über `org.gnome.SessionManager`, `-d` über dessen ScreenSaver-Proxy (gegen Mock-Dienst getestet) |
-| XFCE | über xfce4-power-manager, ohne ihn xfce4-screensaver (gegen Mock-Dienst getestet); dort hält auch `-i` den Bildschirm an |
+| GNOME, Cinnamon, MATE | über `org.gnome.SessionManager`; `-d` unter GNOME und Cinnamon über den ScreenSaver-Proxy des settings-daemon (gegen Mock-Dienst getestet) |
+| XFCE | über xfce4-power-manager, auch wenn er erst später startet; ohne ihn der Bildschirmschoner (gegen Mock-Dienst getestet). Dort hält auch `-i` den Bildschirm an |
 | i3, dwm, bspwm, Openbox … (X11 ohne Desktop-Dienst) | `-d` und `-u` über den X-Server (gegen Xvfb getestet), `-i` über logind |
 | Hyprland (hypridle) | über ScreenSaver-D-Bus bzw. logind |
 | sway, river, niri … (swayidle ab 1.7) | über logind `idle`, sofern swayidle mit logind verbunden ist (eines von `before-sleep`, `after-resume`, `lock`, `unlock`, `idlehint` konfiguriert) |
@@ -161,7 +162,7 @@ Wo Apples Manpage und Apples Code sich widersprechen, folgt dieser Nachbau dem C
 | glibc oder musl | beide |
 | Architektur | beliebig; x86_64 und aarch64 laufen mit allen Tests in der CI, big-endian (s390x, mips, ppc64) wurde unter qemu geprüft |
 | Container, User-Namespace | Anmeldung am Bus auch mit abweichender uid |
-| Kernel | genutzt wird nichts, was neuer ist als 2.6.27; unter 5.3 fehlt pidfd, dann PDEATHSIG und Polling (auf so alten Kerneln nicht getestet) |
+| Kernel | vorausgesetzt wird nichts, was neuer ist als 2.6.27; pidfd (ab 5.3) wird genutzt, wo vorhanden, sonst PDEATHSIG und Polling (auf so alten Kerneln nicht getestet) |
 
 `-u` weckt den Bildschirm dort, wo `SimulateUserActivity` existiert (KDE, xfce4-screensaver), und in
 X11-Sitzungen über den X-Server. Unter GNOME auf Wayland wirkt es nur als Display-Sperre.
