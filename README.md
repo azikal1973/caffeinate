@@ -1,6 +1,6 @@
 # caffeinate für Linux
 
-Version 0.2.0.0
+Version 0.2.0.1
 
 Nachbau von macOS-`caffeinate(8)` in C. Parameter und Verhalten folgen Apples
 Quellcode (PowerManagement/caffeinate), sodass man zwischen Mac und Linux keinen

@@ -4,7 +4,7 @@
 
 stdenv.mkDerivation {
   pname = "caffeinate";
-  version = "0.2.0.0";
+  version = "0.2.0.1";
 
   # only the sources, not a binary that may already sit in the working directory
   src = lib.fileset.toSource {

@@ -7,7 +7,7 @@
 #   make install     install binary and man page under PREFIX (default ~/.local)
 #   make uninstall   remove them again
 
-VERSION = 0.2.0.0
+VERSION = 0.2.0.1
 
 PREFIX  ?= $(HOME)/.local
 BINDIR  ?= $(PREFIX)/bin
