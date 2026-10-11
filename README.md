@@ -55,7 +55,7 @@ gestartet wird.
 
 ```sh
 make static                           # statisches Binary, am besten mit musl (z. B. unter Alpine)
-make test                             # Smoke-Test und D-Bus-Test
+make test                             # Smoke-, D-Bus- und X11-Test
 make asan                             # Build mit Address/UB/LeakSanitizer
 ```
 
@@ -163,8 +163,8 @@ Wo Apples Manpage und Apples Code sich widersprechen, folgt dieser Nachbau dem C
 | Container, User-Namespace | Anmeldung am Bus auch mit abweichender uid |
 | Kernel | genutzt wird nichts, was neuer ist als 2.6.27; unter 5.3 fehlt pidfd, dann PDEATHSIG und Polling (auf so alten Kerneln nicht getestet) |
 
-`-u` weckt den Bildschirm nur dort, wo `SimulateUserActivity` existiert (KDE, XFCE). Auf GNOME wirkt es
-nur als Display-Sperre.
+`-u` weckt den Bildschirm dort, wo `SimulateUserActivity` existiert (KDE, xfce4-screensaver), und in
+X11-Sitzungen über den X-Server. Unter GNOME auf Wayland wirkt es nur als Display-Sperre.
 
 `-s` braucht die Erlaubnis von logind (polkit-Aktion `org.freedesktop.login1.inhibit-block-sleep`). In
 der Standardeinstellung haben sie root und Nutzer mit lokaler Sitzung. Wer nur über SSH angemeldet ist,
@@ -181,8 +181,8 @@ ihn dessen Energieverwaltung trotzdem schlafen. Wer dort über SSH arbeitet, bra
 - `tests/smoke.sh` prüft Optionen, Meldungen und Exit-Codes. Es braucht keinen D-Bus und legt auch
   auf einem Desktop keine echten Sperren an.
 - `tests/dbus.sh` startet einen privaten dbus-daemon mit Mock-Diensten und prüft, welche Sperre wo
-  angelegt und wieder freigegeben wird: KDE, XFCE, GNOME, MATE, logind, ConsoleKit2, Neustart eines Dienstes,
-  Ende des Session-Busses, Netzteil-Erkennung. Es braucht `dbus-daemon` und python3 mit PyGObject, für
+  angelegt und wieder freigegeben wird: KDE, XFCE, GNOME, logind, ConsoleKit2, Neustart eines Dienstes,
+  Ende des Session-Busses, ignorierte Signale, Netzteil-Erkennung. Es braucht `dbus-daemon` und python3 mit PyGObject, für
   die Netzteil-Tests außerdem `unshare`. Was fehlt, wird übersprungen. Der echte Session- und System-Bus
   bleiben unberührt.
 - `tests/x11.sh` startet Xvfb mit Cookie-Anmeldung und prüft, dass `-d` den Bildschirmschoner des
@@ -193,8 +193,8 @@ Die CI (`.github/workflows/build.yml`) baut und testet auf Arch, Debian stable/o
 statische Binary für x86_64 und aarch64, lässt alle Tests damit laufen und startet es auf weiteren
 Distributionen. Bei einem Tag `v*` hängt sie die Binaries an das Release.
 
-Von Hand geprüft wurden außerdem NixOS 26.05 (Flake-Build, echtes logind) und Void Linux mit glibc
-und musl (alle Tests, echtes elogind mit und ohne polkit), jeweils im Container.
+Von Hand geprüft wurden außerdem NixOS 26.05 (Flake-Build, alle Tests, echtes logind ohne polkit)
+und Void Linux mit glibc und musl (alle Tests, echtes elogind mit polkit), jeweils im Container.
 
 Zur Fehlersuche: `CAFFEINATE_DEBUG=1 caffeinate …`
 

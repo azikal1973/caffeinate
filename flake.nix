@@ -29,6 +29,8 @@
             pkgs.dbus
             pkgs.util-linux
             (pkgs.python3.withPackages (p: [ p.pygobject3 ]))
+            # Xvfb fuer tests/x11.sh
+            (pkgs.xorg-server or pkgs.xorg.xorgserver)
           ];
           # PyGObject findet die Typelibs von GLib/Gio hierueber
           GI_TYPELIB_PATH = lib.makeSearchPath "lib/girepository-1.0" [

@@ -1259,7 +1259,8 @@ static bool x11_send(struct xconn *x, const void *req, size_t len)
 static int x11_wait(struct xconn *x, unsigned char pkt[32])
 {
 	for (;;) {
-		if (!recv_all(x->fd, pkt, 32, x->deadline))
+		/* die Frist gilt auch, wenn der Server laufend Ereignisse schickt */
+		if (now_ms() >= x->deadline || !recv_all(x->fd, pkt, 32, x->deadline))
 			return -1;
 
 		unsigned type = pkt[0], seq = pkt[2] | (unsigned)pkt[3] << 8;
@@ -1361,9 +1362,14 @@ static int x11_suspend(bool wake)
 	if (!strncmp(dpy, "unix", 4))
 		dpy += 4;
 	n = *dpy == ':' ? strspn(dpy + 1, "0123456789") : 0;
-	if (n == 0 || n >= sizeof num || (dpy[1 + n] != '\0' && dpy[1 + n] != '.'))
+	if (n == 0 || (dpy[1 + n] != '\0' && dpy[1 + n] != '.'))
 		return -1;
-	memcpy(num, dpy + 1, n);
+	/* ":007" meint Display 7 */
+	for (dpy++; n > 1 && *dpy == '0'; dpy++)
+		n--;
+	if (n >= sizeof num)
+		return -1;
+	memcpy(num, dpy, n);
 	num[n] = '\0';
 	n = (size_t)snprintf(path, sizeof path, "/tmp/.X11-unix/X%s", num);
 	if ((fd = unix_connect(path, n, false)) < 0 && (fd = unix_connect(path, n, true)) < 0) {
@@ -1375,6 +1381,33 @@ static int x11_suspend(bool wake)
 		return -1;
 	}
 	return fd;
+}
+
+/*
+ * Was der X-Server ungefragt schickt, verwerfen (MappingNotify etwa bekommt
+ * jeder Client), damit sich bei ihm nichts staut. Ist der Server weg, die
+ * Verbindung schliessen.
+ */
+static void x11_drain(struct assertion *a)
+{
+	unsigned char junk[512];
+	size_t total = 0;
+	ssize_t n = 1;
+
+	/* in Portionen, damit die Hauptschleife auch bei einer Flut drankommt */
+	for (int i = 0; i < 64 && (n = recv(a->xfd, junk, sizeof junk, MSG_DONTWAIT)) > 0; i++)
+		total += (size_t)n;
+	if (total)
+		DBG("X11: %zu Bytes vom Server verworfen", total);
+	if (n > 0 || (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)))
+		return;
+	DBG("X11: Verbindung beendet");
+	close(a->xfd);
+	a->xfd = -1;
+	if (!a->be && a->fd < 0 && !a->lost) {
+		fprintf(stderr, NAME ": %s: Sperre verloren: X-Server beendet\n", type_name[a - as]);
+		a->lost = true;
+	}
 }
 
 /* ---------------------------------------------------------------- Netzteil */
@@ -1892,12 +1925,16 @@ int main(int argc, char **argv)
 			next = refresh_at;
 
 		long long wait = next == FOREVER ? -1 : next < now ? 0 : next - now;
-		struct pollfd p[3] = { { sfd, POLLIN, 0 }, { pfd, POLLIN, 0 } };
-		nfds_t n = pfd >= 0 ? 2 : 1;
+		struct pollfd p[3 + A_COUNT] = { { sfd, POLLIN, 0 }, { pfd, POLLIN, 0 } };
+		nfds_t n = pfd >= 0 ? 2 : 1, first_x;
 
 		/* Session-Bus: weckt nur, gelesen wird oben */
 		if (user_bus.fd >= 0)
 			p[n++] = (struct pollfd){ user_bus.fd, POLLIN, 0 };
+		first_x = n;
+		for (int i = 0; i < A_COUNT; i++)
+			if (as[i].active && as[i].xfd >= 0)
+				p[n++] = (struct pollfd){ as[i].xfd, POLLIN, 0 };
 
 		if (poll(p, n, wait > INT_MAX ? INT_MAX : (int)wait) < 0) {
 			if (errno == EINTR)
@@ -1915,6 +1952,9 @@ int main(int argc, char **argv)
 		}
 		if (pfd >= 0 && (p[1].revents & (POLLIN | POLLHUP | POLLERR)))
 			break;
+		for (int i = 0; i < A_COUNT; i++)
+			if (as[i].active && as[i].xfd >= 0 && p[first_x++].revents)
+				x11_drain(&as[i]);
 	}
 
 	release_all();

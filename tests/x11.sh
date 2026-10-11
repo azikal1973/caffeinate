@@ -38,7 +38,8 @@ check() {	# Beschreibung, erwartet, tatsaechlich
 python3 "$HERE/x11check.py" "$T/xauth" mkauth
 # -noreset: sonst setzt sich der Server zurueck, sobald der letzte Client geht, und vergisst den Timeout
 Xvfb -displayfd 3 -auth "$T/xauth" -noreset -nolisten tcp -screen 0 640x480x8 3> "$T/display" 2>/dev/null &
-pids=$!
+xvfb=$!
+pids=$xvfb
 i=0
 while [ ! -s "$T/display" ]; do
 	i=$((i + 1))
@@ -97,5 +98,23 @@ check "unter Wayland wird der X-Server nicht benutzt: Exit 1" 1 "$?"
 
 "$C" -i -t 1 2>/dev/null
 check "-i benutzt den X-Server nicht: Exit 1" 1 "$?"
+
+# der X-Server endet: caffeinate meldet die verlorene Sperre und laeuft weiter
+"$C" -d 2> "$T/err" &
+cpid=$!
+pids="$pids $cpid"
+sleep 1
+kill "$xvfb"
+wait "$xvfb" 2>/dev/null
+i=0
+while [ ! -s "$T/err" ] && [ "$i" -lt 30 ]; do
+	i=$((i + 1))
+	sleep 0.1
+done
+check "X-Server endet: Meldung" "caffeinate: PreventUserIdleDisplaySleep: Sperre verloren: X-Server beendet" "$(cat "$T/err")"
+kill -0 "$cpid" 2>/dev/null
+check "X-Server endet: caffeinate laeuft weiter" 0 "$?"
+kill "$cpid" 2>/dev/null
+wait "$cpid" 2>/dev/null
 
 exit $fail
