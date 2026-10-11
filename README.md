@@ -175,6 +175,79 @@ darf jeder anlegen, solange polkit überhaupt läuft.
 Die `idle`-Sperre bei logind beachten nicht alle: Steht ein Rechner am GNOME-Anmeldebildschirm, legt
 ihn dessen Energieverwaltung trotzdem schlafen. Wer dort über SSH arbeitet, braucht `-s` als root.
 
+## Ohne caffeinate: Bordmittel
+
+Linux bringt Werkzeuge mit, die dieselben Sperren anlegen. Auf einem einzelnen Rechner reichen sie oft
+aus. caffeinate fasst sie unter einer Befehlszeile zusammen, die auf jedem Desktop und auf dem Mac
+gleich ist.
+
+### Sperre, solange ein Befehl läuft
+
+```sh
+# systemd; unter elogind heißt das Programm elogind-inhibit
+systemd-inhibit --what=idle make                           # die Sperre von caffeinate -i ohne Desktop
+systemd-inhibit --what=sleep make                          # wie caffeinate -s, aber auch im Akkubetrieb
+systemd-inhibit --what=idle sleep infinity                 # ohne Befehl, bis Strg+C
+systemd-inhibit --what=idle sleep 3600                     # wie -t 3600
+systemd-inhibit --what=idle tail --pid=4711 -f /dev/null   # wie -w 4711 (GNU tail)
+systemd-inhibit --list                                     # zeigt alle Sperren bei logind
+
+# KDE Plasma
+kde-inhibit --power make                                   # wie caffeinate -i
+kde-inhibit --screenSaver make                             # wie caffeinate -d
+
+# GNOME; unter MATE mate-session-inhibit mit denselben Werten für --inhibit
+gnome-session-inhibit --inhibit suspend make               # wie caffeinate -i
+gnome-session-inhibit --inhibit idle make                  # wie caffeinate -d
+gnome-session-inhibit --inhibit-only                       # ohne Befehl, bis Strg+C
+```
+
+Diese Sperren enden wie die von caffeinate mit dem Prozess. Drei Dinge sollte man wissen:
+
+- `--what=idle` wirkt nicht überall gleich. Die Sperre gilt bei logind. KDE behandelt sie wie eine
+  Sperre von `-d`, dort bleibt also auch der Bildschirm an; mit `--what=sleep` darf er wie bei `-i`
+  abschalten (geprüft mit Plasma 6.7). GNOME beachtet sie am Anmeldebildschirm nicht, siehe oben. Auf
+  einem Desktop ist dessen eigenes Werkzeug die sichere Wahl.
+- `kde-inhibit` gibt den Exit-Status des Befehls nicht weiter, es endet immer mit 0 (kde-cli-tools 6.7).
+  `systemd-inhibit` reicht ihn durch.
+- Ein einzelner D-Bus-Aufruf hält nichts. `busctl call`, `gdbus call`, `dbus-send` und `qdbus` bekommen
+  zwar ein Cookie zurück, die Sperre hängt aber an der Verbindung des Aufrufers und ist weg, sobald das
+  Werkzeug endet (unter KDE mit `busctl` und `gdbus` geprüft).
+
+### Nutzer als aktiv melden
+
+```sh
+xdg-screensaver reset                # meldet dem Bildschirmschoner Aktivität, wie caffeinate -u
+xset s reset; xset dpms force on     # X11: dasselbe direkt beim X-Server, Bildschirm einschalten
+```
+
+### Schalter statt Sperre
+
+Diese Einstellungen hängen an keinem Prozess. Sie gelten, bis man sie zurücknimmt, auch wenn das Skript
+dazwischen abbricht.
+
+```sh
+xset s off -dpms                     # X11: Bildschirmschoner und DPMS aus, gilt bis zum Abmelden
+xset s on +dpms                      # und wieder an
+setterm --blank=0 --powerdown=0      # Textkonsole: der Bildschirm bleibt an
+
+# XFCE: Präsentationsmodus von xfce4-power-manager, zurück mit -s false
+xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/presentation-mode -n -t bool -s true
+
+# gar kein Ruhezustand mehr, auch kein ausdrücklich angeforderter; zurück mit unmask
+sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+```
+
+Soll der Rechner nie von selbst schlafen, gehört das in die Energieeinstellungen des Desktops oder in
+`/etc/systemd/logind.conf` (`IdleAction`, `HandleLidSwitch`).
+
+### Was caffeinate dem hinzufügt
+
+caffeinate nimmt einem die Wahl des Werkzeugs ab: Es fragt den Dienst, der auf dem laufenden Desktop
+zuständig ist, und nimmt logind, wenn keiner da ist. Dazu kommen `-t` neben einem command, `-w`, `-s`
+nur am Netzteil und das Neuanlegen der Sperre, wenn der Dienst neu startet. Skripte laufen unverändert
+auf dem Mac.
+
 ## Tests
 
 `make test` startet drei Skripte:
