@@ -5,10 +5,15 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Nur lesen; schreiben darf allein der Release-Job.
+permissions:
+  contents: read
+
 jobs:
   # Bauen und testen mit dem Compiler und der libc der jeweiligen Distribution.
-  # dbus-daemon und PyGObject sind fuer tests/dbus.sh; --privileged erlaubt
-  # dessen Netzteil-Tests (Mount-Namespace).
+  # dbus-daemon und PyGObject sind fuer tests/dbus.sh, Xvfb fuer tests/x11.sh.
+  # --privileged erlaubt die Netzteil-Tests (Mount-Namespace); der Container
+  # laeuft auf einem Wegwerf-Runner, auf dem der Job ohnehin alles darf.
   build:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
@@ -18,16 +23,16 @@ jobs:
         include:
           - name: Arch Linux
             image: archlinux:latest
-            setup: pacman -Syu --noconfirm --needed gcc make dbus python-gobject
+            setup: pacman -Syu --noconfirm --needed gcc make dbus python-gobject xorg-server-xvfb
           - name: Debian stable
             image: debian:stable
-            setup: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y gcc libc6-dev make dbus python3-gi
+            setup: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y gcc libc6-dev make dbus python3-gi xvfb
           - name: Debian oldstable
             image: debian:oldstable
             setup: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y gcc libc6-dev make dbus python3-gi
           - name: Ubuntu 22.04
             image: ubuntu:22.04
-            setup: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y gcc libc6-dev make dbus python3-gi
+            setup: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y gcc libc6-dev make dbus python3-gi xvfb
           - name: Fedora (clang)
             image: fedora:latest
             setup: dnf install -y clang make dbus-daemon python3-gobject-base
@@ -40,7 +45,7 @@ jobs:
             setup: zypper -n install gcc make dbus-1-daemon python3-gobject
           - name: Alpine (musl)
             image: alpine:latest
-            setup: apk add --no-cache build-base dbus py3-gobject3
+            setup: apk add --no-cache build-base dbus py3-gobject3 xvfb
     steps:
       - uses: actions/checkout@v4
       - name: Bauen und testen
@@ -49,6 +54,7 @@ jobs:
             '${{ matrix.setup }} && make CC=${{ matrix.cc || 'cc' }} && make test'
 
   # Statisches Binary (musl), das ohne Installation auf jeder Distribution laeuft.
+  # Alle Tests laufen hier mit genau diesem Binary, auf aarch64 nur hier.
   static:
     name: Statisches Binary (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -62,10 +68,10 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-      - name: Bauen (Alpine, musl)
+      - name: Bauen und testen (Alpine, musl)
         run: |
-          docker run --rm -v "$PWD:/src" -w /src alpine:latest sh -c \
-            'apk add --no-cache build-base && make static && cp caffeinate caffeinate-${{ matrix.arch }}-linux'
+          docker run --rm --privileged -v "$PWD:/src" -w /src alpine:latest sh -c \
+            'apk add --no-cache build-base dbus py3-gobject3 xvfb && make static && make test && cp caffeinate caffeinate-${{ matrix.arch }}-linux'
       - name: Auf anderen Distributionen starten
         run: |
           for image in debian:oldstable ubuntu:20.04 rockylinux:8 fedora:latest; do

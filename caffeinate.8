@@ -41,8 +41,9 @@ Unter Linux gibt es kein Gegenstueck; die Option wird angenommen und ist
 ohne Wirkung.
 .TP
 .B \-s
-Verhindert jeden System-Sleep. Gilt nur am Netzteil; der Netzstatus wird
-alle 5 Sekunden geprueft.
+Verhindert System-Sleep, auch einen ausdruecklich angeforderten. Gilt nur
+am Netzteil; der Netzstatus wird alle 5 Sekunden geprueft. Das Zuklappen
+des Deckels wirkt in der Standardeinstellung von logind trotzdem.
 .TP
 .B \-u
 Meldet den Nutzer als aktiv (weckt den Bildschirm) und verhindert
@@ -83,7 +84,9 @@ und endet mit dem command.
 .SH EXIT-STATUS
 Ohne command 0. Nach einem Signal (z. B. Strg+C) endet
 .B caffeinate
-an diesem Signal. Laesst sich eine Sperre nicht anlegen, erscheinen der
+an diesem Signal; ignorierte Signale
+.RB ( nohup )
+bleiben ignoriert. Laesst sich eine Sperre nicht anlegen, erscheinen der
 Grund und
 .RI \(dqFailed\ to\ create\  Typ \ assertion\(dq ,
 der Exit-Status ist 1. Bei einem ungueltigen Aufruf wird die Usage
@@ -93,11 +96,12 @@ nicht zu finden, 127, sonst 126.
 .TP
 .B \-i
 org.freedesktop.PowerManagement.Inhibit (KDE, XFCE), sonst
-org.gnome.SessionManager bzw. org.mate.SessionManager (Flag suspend)
+org.gnome.SessionManager (GNOME, Cinnamon, MATE; Flag suspend). Unter XFCE
+haelt diese Sperre auch den Bildschirm an.
 .TP
 .BR \-d ", " \-u
-org.freedesktop.ScreenSaver.Inhibit, sonst org.xfce.ScreenSaver oder
-Session-Manager (Flag idle);
+org.freedesktop.ScreenSaver.Inhibit, unter XFCE xfce4-power-manager (ohne
+ihn org.xfce.ScreenSaver), sonst org.gnome.SessionManager (Flag idle);
 .B \-u
 ruft vorher SimulateUserActivity auf
 .TP
@@ -105,21 +109,36 @@ ruft vorher SimulateUserActivity auf
 logind-Inhibitor
 .IR sleep .
 Am Netz ist der Rechner, wenn eine Stromquelle online meldet oder kein
-Akku entlaedt. Die Sperre braucht die Erlaubnis von logind (polkit); ohne
-lokale Sitzung, etwa ueber SSH, haben sie in der Standardeinstellung nur
-Administratoren.
+Akku entlaedt; ein USB-C-Port, der selbst ein Geraet speist, zaehlt nicht.
+Die Sperre braucht die Erlaubnis von logind (polkit); ohne lokale Sitzung,
+etwa ueber SSH, haben sie in der Standardeinstellung nur Administratoren.
 .PP
 Ohne Session-Bus (TTY, SSH) oder ohne passenden Desktop-Dienst wird der
 logind-Inhibitor
 .I idle
 verwendet. elogind funktioniert genauso, ohne beide wird ConsoleKit2
-versucht. Alle Sperren enden mit dem Prozess, auch bei
+versucht. logind fragt dafuer polkit; laeuft keines, lehnt es jeden ausser
+root ab. Alle Sperren enden mit dem Prozess, auch bei
 .BR "kill \-9" .
+.PP
+In einer X11-Sitzung setzen
+.B \-d
+und
+.B \-u
+zusaetzlich den Bildschirmschoner und DPMS des X-Servers aus (Erweiterung
+MIT-SCREEN-SAVER), solange die Sperre gilt. Das wirkt auch ohne jeden
+Desktop-Dienst, etwa unter i3 oder dwm, und auf Programme, die dem
+Bildschirmschoner des Servers folgen (xss-lock). Programme, die die
+Leerlaufzeit selbst messen (xautolock, xidlehook), bemerken davon nichts.
+.B \-u
+beendet ausserdem einen laufenden Bildschirmschoner und schaltet den
+Bildschirm ein. Unter Wayland wird der X-Server nicht benutzt.
 .PP
 Startet ein Desktop-Dienst neu, legt
 .B caffeinate
 die Sperre dort neu an. Solange der Dienst fehlt, haelt logind eine
-Ersatzsperre.
+Ersatzsperre. Laesst sich eine verlorene Sperre nirgends ersetzen, steht
+das einmal auf stderr.
 .PP
 D-Bus wird direkt auf dem Socket gesprochen; ausser der libc wird keine
 Bibliothek gebraucht.
@@ -140,6 +159,18 @@ Genutzt werden nur Unix-Sockets.
 .B DBUS_SYSTEM_BUS_ADDRESS
 Adresse des System-Busses statt
 .IR /run/dbus/system_bus_socket .
+.TP
+.BR DISPLAY ", " XAUTHORITY ", " WAYLAND_DISPLAY
+Der X-Server wird nur angesprochen, wenn
+.B DISPLAY
+ein lokales Display nennt
+.RI ( :0 )
+und
+.B WAYLAND_DISPLAY
+nicht gesetzt ist. Das Cookie stammt aus
+.B XAUTHORITY
+bzw.
+.IR ~/.Xauthority .
 .SH BEISPIELE
 .TP
 .B caffeinate \-i make

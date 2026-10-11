@@ -16,25 +16,33 @@
  *
  * Abbildung der macOS-Assertions:
  *   -i  PreventUserIdleSystemSleep  -> org.freedesktop.PowerManagement.Inhibit
- *                                      (GNOME/MATE: SessionManager, Flag suspend)
+ *                                      (sonst SessionManager, Flag suspend)
  *   -d  PreventUserIdleDisplaySleep -> org.freedesktop.ScreenSaver.Inhibit
- *                                      (XFCE: org.xfce.ScreenSaver,
- *                                      GNOME/MATE: SessionManager, Flag idle)
+ *                                      (XFCE: xfce4-power-manager bzw.
+ *                                      org.xfce.ScreenSaver; sonst
+ *                                      SessionManager, Flag idle)
  *   -s  PreventSystemSleep (nur AC) -> logind-Inhibitor "sleep"
  *   -u  UserIsActive                -> ScreenSaver.SimulateUserActivity + wie -d
  *   -m  PreventDiskIdle             -> kein Gegenstueck, wird angenommen
  * Ohne Session-Bus oder ohne passenden Desktop-Dienst fallen -i/-d/-u auf
  * den logind-Inhibitor "idle" zurueck. logind heisst hier auch elogind;
  * ConsoleKit2 hat dieselbe Schnittstelle und wird danach versucht.
+ * In einer X11-Sitzung setzen -d/-u zusaetzlich Bildschirmschoner und DPMS
+ * des X-Servers aus - das wirkt auch ohne jeden Desktop-Dienst (i3, dwm ...).
  *
- * Alle Sperren haengen an Bus-Verbindungen bzw. am logind-fd und fallen
- * weg, sobald der Prozess endet - auch bei kill -9. Startet ein
+ * Alle Sperren haengen an Verbindungen (Bus, X-Server) bzw. am logind-fd
+ * und fallen weg, sobald der Prozess endet - auch bei kill -9. Startet ein
  * Desktop-Dienst neu und vergisst damit die Sperre, wird sie neu angelegt.
  *
- * Gebraucht wird nur die libc: D-Bus wird direkt auf dem Socket gesprochen.
+ * Gebraucht wird nur die libc: D-Bus und X11 werden direkt auf dem Socket
+ * gesprochen.
  * Statisch gelinkt laeuft das Binary damit auf jeder Distribution.
  */
 #define _GNU_SOURCE
+/* Haertung der libc-Aufrufe, wenn Compiler oder Distribution sie nicht schon vorgeben */
+#if !defined(_FORTIFY_SOURCE) && defined(__OPTIMIZE__)
+# define _FORTIFY_SOURCE 2
+#endif
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -109,23 +117,28 @@ struct backend {
 #define FDO_SS      "org.freedesktop.ScreenSaver"
 #define XFCE_SS     "org.xfce.ScreenSaver"
 #define FDO_PM      "org.freedesktop.PowerManagement"
+#define PM_INHIBIT  "/org/freedesktop/PowerManagement/Inhibit", FDO_PM ".Inhibit", "UnInhibit"
+/* auch Cinnamon und MATE: deren Session-Manager melden sich unter dem GNOME-Namen */
 #define GNOME_SM    "org.gnome.SessionManager", "/org/gnome/SessionManager", "org.gnome.SessionManager", "Uninhibit"
-#define MATE_SM     "org.mate.SessionManager", "/org/mate/SessionManager", "org.mate.SessionManager", "Uninhibit"
 
+/*
+ * XFCE: xfce4-power-manager schaltet per DPMS ab und haelt, solange es
+ * gesperrt ist, auch den Bildschirmschoner an. org.xfce.ScreenSaver allein
+ * liesse DPMS laufen und zaehlt deshalb nur, wenn der Power-Manager fehlt.
+ */
 static const struct backend display_backends[] = {
 	{ FDO_SS, "/org/freedesktop/ScreenSaver", FDO_SS, "UnInhibit", 0 },
 	{ FDO_SS, "/ScreenSaver", FDO_SS, "UnInhibit", 0 },	/* manche Dienste kennen nur diesen Pfad */
+	{ "org.xfce.PowerManager", PM_INHIBIT, 0 },
 	{ XFCE_SS, "/org/xfce/ScreenSaver", XFCE_SS, "UnInhibit", 0 },
 	{ GNOME_SM, GSM_IDLE },
-	{ MATE_SM, GSM_IDLE },
 	{ NULL, NULL, NULL, NULL, 0 }
 };
 
 /* PowerDevil (KDE) und xfce4-power-manager; nur KDE besitzt auch den Namen "...Inhibit" */
 static const struct backend system_backends[] = {
-	{ FDO_PM, "/org/freedesktop/PowerManagement/Inhibit", FDO_PM ".Inhibit", "UnInhibit", 0 },
+	{ FDO_PM, PM_INHIBIT, 0 },
 	{ GNOME_SM, GSM_SUSPEND },
-	{ MATE_SM, GSM_SUSPEND },
 	{ NULL, NULL, NULL, NULL, 0 }
 };
 
@@ -141,10 +154,12 @@ static const struct {
 struct assertion {
 	bool active;
 	bool stale;			/* Dienst neu gestartet: Sperre neu anlegen */
+	bool lost;			/* zurzeit ganz ohne Sperre, schon gemeldet */
 	long long expires;		/* CLOCK_MONOTONIC in ms oder FOREVER */
 	const struct backend *be;	/* Session-Bus-Sperre */
 	uint32_t cookie;
 	int fd;				/* logind-Sperre */
+	int xfd;			/* Verbindung zum X-Server, die dessen Bildschirmschoner aussetzt */
 };
 
 static struct assertion as[A_COUNT];
@@ -152,6 +167,7 @@ static long long refresh_at = FOREVER;	/* wann stale-Sperren neu angelegt werden
 static bool retry;			/* danach noch einmal nachfassen */
 static char details[160];
 static char reason[256];		/* warum der letzte Aufruf scheiterte */
+static enum { E_OTHER, E_ABSENT, E_DENIED } failure;	/* ... und auf welche Art */
 
 /* ---------------------------------------------------------------- Hilfen */
 
@@ -306,11 +322,11 @@ struct bus {
 	int fd;				/* -1: nicht verbunden */
 	bool tried;
 	uint32_t serial;
-	unsigned char in[4096];
-	size_t have;			/* Bytes in in[] */
-	size_t done;			/* Laenge der zuletzt gelieferten Nachricht */
+	unsigned char in[4096];		/* die Nachricht, die gerade gelesen wird */
+	size_t have;			/* Bytes davon in in[] */
 	size_t skip;			/* Rest einer zu grossen Nachricht, die ueberlesen wird */
-	int fds[4];			/* per SCM_RIGHTS empfangen, noch nicht abgeholt */
+	bool done;			/* Nachricht ist ausgeliefert, mit dem naechsten Lesen beginnt eine neue */
+	int fds[4];			/* per SCM_RIGHTS mit dieser Nachricht gekommen */
 	int nfds;
 };
 
@@ -321,7 +337,7 @@ static struct bus sys_bus = { .what = "System-Bus", .fd = -1 };
 struct message {
 	int type;
 	bool big;			/* big-endian */
-	uint32_t reply_serial, unix_fds;
+	uint32_t reply_serial;
 	const char *iface, *member, *error, *sender, *sig;
 	const unsigned char *body;
 	size_t body_len;
@@ -410,27 +426,22 @@ static void put_field(struct out *o, unsigned char code, char type, const char *
 		put_str(o, val);
 }
 
+/* fds der aktuellen Nachricht schliessen, soweit sie niemand abgeholt hat */
+static void bus_drop_fds(struct bus *b)
+{
+	while (b->nfds > 0)
+		if (b->fds[--b->nfds] >= 0)
+			close(b->fds[b->nfds]);
+}
+
 static void bus_kill(struct bus *b)
 {
 	if (b->fd >= 0)
 		close(b->fd);
 	b->fd = -1;
-	while (b->nfds > 0)
-		if (b->fds[--b->nfds] >= 0)
-			close(b->fds[b->nfds]);
-	b->have = b->done = b->skip = 0;
-}
-
-/* Die n fds der eben verarbeiteten Nachricht aus der Schlange nehmen und schliessen */
-static void bus_drop_fds(struct bus *b, uint32_t n)
-{
-	int k = n < (uint32_t)b->nfds ? (int)n : b->nfds;
-
-	for (int i = 0; i < k; i++)
-		if (b->fds[i] >= 0)
-			close(b->fds[i]);
-	memmove(b->fds, b->fds + k, (size_t)(b->nfds - k) * sizeof *b->fds);
-	b->nfds -= k;
+	bus_drop_fds(b);
+	b->have = b->skip = 0;
+	b->done = false;
 }
 
 /* Auf fd warten, laengstens bis deadline; false bei Timeout */
@@ -451,29 +462,61 @@ static bool wait_fd(int fd, short events, long long deadline)
 	}
 }
 
-static bool bus_send(struct bus *b, const void *data, size_t len)
+/* Alles senden, laengstens bis deadline */
+static bool send_all(int fd, const void *data, size_t len, long long deadline)
 {
-	long long deadline = now_ms() + CALL_TIMEOUT_MS;
 	const unsigned char *p = data;
 
 	while (len > 0) {
-		ssize_t n = send(b->fd, p, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+		ssize_t n = send(fd, p, len, MSG_NOSIGNAL | MSG_DONTWAIT);
 
 		if (n >= 0) {
 			p += n;
 			len -= (size_t)n;
 		} else if (errno != EINTR &&
-		           ((errno != EAGAIN && errno != EWOULDBLOCK) || !wait_fd(b->fd, POLLOUT, deadline))) {
-			DBG("%s: Senden fehlgeschlagen", b->what);
-			bus_kill(b);	/* halb gesendete Nachricht: Verbindung unbrauchbar */
+		           ((errno != EAGAIN && errno != EWOULDBLOCK) || !wait_fd(fd, POLLOUT, deadline))) {
 			return false;
 		}
 	}
 	return true;
 }
 
-/* Mehr Daten in den Puffer holen: 1 = gelesen, 0 = Timeout, -1 = Verbindung weg */
-static int bus_recv(struct bus *b, long long deadline)
+/* Genau len Bytes lesen, laengstens bis deadline; buf == NULL: verwerfen */
+static bool recv_all(int fd, void *buf, size_t len, long long deadline)
+{
+	unsigned char junk[256], *p = buf;
+
+	while (len > 0) {
+		ssize_t n = recv(fd, p ? p : junk, p || len < sizeof junk ? len : sizeof junk, MSG_DONTWAIT);
+
+		if (n > 0) {
+			if (p)
+				p += n;
+			len -= (size_t)n;
+		} else if (n == 0 || (errno != EINTR &&
+		           ((errno != EAGAIN && errno != EWOULDBLOCK) || !wait_fd(fd, POLLIN, deadline)))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool bus_send(struct bus *b, const void *data, size_t len)
+{
+	if (send_all(b->fd, data, len, now_ms() + CALL_TIMEOUT_MS))
+		return true;
+	DBG("%s: Senden fehlgeschlagen", b->what);
+	bus_kill(b);	/* halb gesendete Nachricht: Verbindung unbrauchbar */
+	return false;
+}
+
+/*
+ * Hoechstens want Bytes hinter die schon gelesenen holen: 1 = gelesen,
+ * 0 = Timeout, -1 = Verbindung weg. Der Aufrufer liest nie ueber das Ende
+ * einer Nachricht hinaus. fds reisen mit dem ersten Byte ihrer Nachricht,
+ * was hier ankommt, gehoert also immer zu der, die gerade gelesen wird.
+ */
+static int bus_recv(struct bus *b, size_t want, long long deadline)
 {
 	union {
 		char buf[CMSG_SPACE(sizeof b->fds)];
@@ -483,7 +526,7 @@ static int bus_recv(struct bus *b, long long deadline)
 	if (b->fd < 0)
 		return -1;
 	for (;;) {
-		struct iovec iov = { b->in + b->have, sizeof b->in - b->have };
+		struct iovec iov = { b->in + b->have, want };
 		struct msghdr mh = { .msg_iov = &iov, .msg_iovlen = 1,
 		                     .msg_control = ctl.buf, .msg_controllen = sizeof ctl.buf };
 		ssize_t n = recvmsg(b->fd, &mh, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
@@ -519,38 +562,77 @@ static int bus_recv(struct bus *b, long long deadline)
 	}
 }
 
-/* Headerfelder einer vollstaendig gelesenen Nachricht auswerten */
+/* Ausrichtung eines D-Bus-Typs, bei denen fester Groesse zugleich diese; 0 = unbekannt */
+static size_t type_align(int type)
+{
+	switch (type) {
+	case 'y': case 'g': case 'v':
+		return 1;
+	case 'n': case 'q':
+		return 2;
+	case 'b': case 'i': case 'u': case 'h': case 's': case 'o': case 'a':
+		return 4;
+	case 'x': case 't': case 'd': case '(': case '{':
+		return 8;
+	default:
+		return 0;
+	}
+}
+
+/*
+ * Headerfelder einer vollstaendig gelesenen Nachricht auswerten. Felder,
+ * die hier niemand kennt, werden uebersprungen, soweit ihr Typ einfach oder
+ * ein Array ist; bei Strukturen und Varianten (in keinem definierten Feld
+ * verwendet) ist Schluss.
+ */
 static void parse_fields(const unsigned char *p, size_t fields_len, struct message *m)
 {
 	size_t i = 16, end = 16 + fields_len;
 
 	for (;;) {
+		const unsigned char *sig;
 		const char *s = NULL;
-		uint32_t u = 0, n;
+		uint32_t u = 0, n, sig_len;
+		size_t align;
 		unsigned char code, type;
 
-		/* Feld = Code, Signatur aus einem Zeichen, Wert. Die definierten
-		 * Felder haben nur die Typen u, s, o und g; bei allem anderen ist Schluss. */
+		/* Feld = Code, Signatur, Wert; jedes beginnt auf einer 8er-Grenze */
 		i = (i + 7) & ~(size_t)7;
-		if (i + 4 > end || p[i + 1] != 1 || p[i + 3] != '\0')
+		if (i + 4 > end)
 			return;
 		code = p[i];
-		type = p[i + 2];
-		i += 4;
-		if (type == 'u') {
-			if (end - i < 4)
-				return;
-			u = rd32(p + i, m->big);
-			i += 4;
-		} else if (type == 's' || type == 'o') {
+		sig_len = p[i + 1];
+		sig = p + i + 2;
+		if (sig_len == 0 || sig_len > end - i - 3 || sig[sig_len] != '\0')
+			return;
+		type = sig[0];
+		align = type_align(type);
+		i += 3 + sig_len;
+		if (!align || type == 'v' || type == '(' || type == '{')
+			return;
+		i = (i + align - 1) & ~(align - 1);
+		if (i > end)
+			return;
+		if (type == 's' || type == 'o' || type == 'a') {
 			if (end - i < 4)
 				return;
 			n = rd32(p + i, m->big);
 			i += 4;
-			if (n >= end - i || p[i + n] != '\0')
-				return;
-			s = (const char *)p + i;
-			i += (size_t)n + 1;
+			if (type == 'a') {
+				/* Laenge in Bytes ab dem ersten, ausgerichteten Element */
+				align = type_align(sig[1]);
+				if (!align)
+					return;
+				i = (i + align - 1) & ~(align - 1);
+				if (i > end || n > end - i)
+					return;
+				i += n;
+			} else {
+				if (n >= end - i || p[i + n] != '\0')
+					return;
+				s = (const char *)p + i;
+				i += (size_t)n + 1;
+			}
 		} else if (type == 'g') {
 			if (end - i < 1)
 				return;
@@ -560,16 +642,22 @@ static void parse_fields(const unsigned char *p, size_t fields_len, struct messa
 			s = (const char *)p + i;
 			i += (size_t)n + 1;
 		} else {
-			return;
+			if (end - i < align)
+				return;
+			if (type == 'u')
+				u = rd32(p + i, m->big);
+			i += align;
 		}
-		switch (code) {
-		case F_IFACE:        m->iface = s; break;
-		case F_MEMBER:       m->member = s; break;
-		case F_ERROR:        m->error = s; break;
-		case F_SENDER:       m->sender = s; break;
-		case F_SIGNATURE:    m->sig = s; break;
-		case F_REPLY_SERIAL: m->reply_serial = u; break;
-		case F_UNIX_FDS:     m->unix_fds = u; break;
+		if (s) {
+			switch (code) {
+			case F_IFACE:     m->iface = s; break;
+			case F_MEMBER:    m->member = s; break;
+			case F_ERROR:     m->error = s; break;
+			case F_SENDER:    m->sender = s; break;
+			case F_SIGNATURE: m->sig = s; break;
+			}
+		} else if (code == F_REPLY_SERIAL && type == 'u') {
+			m->reply_serial = u;
 		}
 	}
 }
@@ -580,19 +668,23 @@ static int bus_next(struct bus *b, long long deadline, struct message *m)
 	for (;;) {
 		int r;
 
-		/* zuletzt gelieferte bzw. zu grosse Nachricht aus dem Puffer nehmen */
-		if (b->done || b->skip) {
-			size_t n = b->done ? b->done : b->have < b->skip ? b->have : b->skip;
-
-			memmove(b->in, b->in + n, b->have - n);
-			b->have -= n;
-			if (b->done)
-				b->done = 0;
-			else
-				b->skip -= n;
+		if (b->done) {
+			/* die letzte ist verarbeitet; fds, die niemand abgeholt hat, verfallen */
+			b->done = false;
+			b->have = 0;
+			bus_drop_fds(b);
 		}
-		if (b->skip || b->have < 16) {
-			if ((r = bus_recv(b, deadline)) <= 0)
+		if (b->skip) {
+			/* Rest einer zu grossen Nachricht verwerfen, samt ihrer fds */
+			if ((r = bus_recv(b, b->skip < sizeof b->in ? b->skip : sizeof b->in, deadline)) <= 0)
+				return r;
+			b->skip -= b->have;
+			b->have = 0;
+			bus_drop_fds(b);
+			continue;
+		}
+		if (b->have < 16) {
+			if ((r = bus_recv(b, 16 - b->have, deadline)) <= 0)
 				return r;
 			continue;
 		}
@@ -612,11 +704,13 @@ static int bus_next(struct bus *b, long long deadline, struct message *m)
 		if (total > sizeof b->in) {
 			/* erwartet hier niemand; fremde Nachricht ueberlesen */
 			DBG("%s: Nachricht mit %zu Bytes uebergangen", b->what, total);
-			b->skip = total;
+			b->skip = total - b->have;
+			b->have = 0;
+			bus_drop_fds(b);
 			continue;
 		}
 		if (b->have < total) {
-			if ((r = bus_recv(b, deadline)) <= 0)
+			if ((r = bus_recv(b, total - b->have, deadline)) <= 0)
 				return r;
 			continue;
 		}
@@ -626,7 +720,7 @@ static int bus_next(struct bus *b, long long deadline, struct message *m)
 		m->body = b->in + body_off;
 		m->body_len = body_len;
 		parse_fields(b->in, fields_len, m);
-		b->done = total;
+		b->done = true;
 		return 1;
 	}
 }
@@ -658,7 +752,7 @@ static void bus_other(struct bus *b, const struct message *m)
 	    m->member && !strcmp(m->member, "NameOwnerChanged") &&
 	    m->sig && !strncmp(m->sig, "sss", 3) && (name = body_str(m, &off)))
 		name_changed(name);
-	bus_drop_fds(b, m->unix_fds);
+	bus_drop_fds(b);
 }
 
 /*
@@ -676,6 +770,7 @@ static bool call(struct bus *b, bool autostart, const char *dest, const char *pa
 	struct message m;
 	va_list ap;
 
+	failure = E_OTHER;
 	if (!b || b->fd < 0)
 		return false;
 
@@ -717,7 +812,8 @@ static bool call(struct bus *b, bool autostart, const char *dest, const char *pa
 	long long deadline = now_ms() + CALL_TIMEOUT_MS;
 
 	for (;;) {
-		int r = bus_next(b, deadline, &m);
+		/* die Frist gilt auch, wenn laufend fremde Nachrichten eintreffen */
+		int r = now_ms() < deadline ? bus_next(b, deadline, &m) : 0;
 
 		if (r <= 0) {
 			fail("%s.%s: %s", iface, member, r ? "Verbindung getrennt" : "keine Antwort");
@@ -734,14 +830,19 @@ static bool call(struct bus *b, bool autostart, const char *dest, const char *pa
 		size_t off = 0;
 		const char *text = m.sig && m.sig[0] == 's' ? body_str(&m, &off) : NULL;
 
+		if (m.error && (!strcmp(m.error, DBUS_NAME ".Error.ServiceUnknown") ||
+		                !strcmp(m.error, DBUS_NAME ".Error.NameHasNoOwner")))
+			failure = E_ABSENT;	/* den Dienst gibt es nicht */
+		else if (m.error && !strcmp(m.error, DBUS_NAME ".Error.AccessDenied"))
+			failure = E_DENIED;
 		fail("%s.%s: %s", iface, member, text ? text : m.error ? m.error : "Fehler");
 	} else if (want) {
 		uint32_t v = m.body_len >= 4 ? rd32(m.body, m.big) : 0;
 
 		ok = m.sig && m.sig[0] == want && m.body_len >= 4;
 		if (ok && want == 'h') {
-			/* der Wert ist der Index in die mitgeschickten fds */
-			ok = v < m.unix_fds && v < (uint32_t)b->nfds && b->fds[v] >= 0;
+			/* der Wert ist der Index in die fds dieser Nachricht */
+			ok = v < (uint32_t)b->nfds && b->fds[v] >= 0;
 			if (ok) {
 				*(int *)out = b->fds[v];
 				b->fds[v] = -1;
@@ -752,7 +853,7 @@ static bool call(struct bus *b, bool autostart, const char *dest, const char *pa
 		if (!ok)
 			fail("%s.%s: unerwartete Antwort", iface, member);
 	}
-	bus_drop_fds(b, m.unix_fds);
+	bus_drop_fds(b);
 	return ok;
 }
 
@@ -910,22 +1011,23 @@ fail:
 /*
  * Session-Bus ohne X11-Autolaunch: DBUS_SESSION_BUS_ADDRESS, sonst der Bus
  * des systemd-Nutzerdienstes. Der hilft auch, wenn die Variable veraltet
- * ist (tmux, su) oder XDG_RUNTIME_DIR fehlt (cron).
+ * ist (tmux, su), der Bus dort die Anmeldung ablehnt oder XDG_RUNTIME_DIR
+ * fehlt (cron).
  */
 static struct bus *get_user_bus(void)
 {
 	static const struct backend *const lists[] = { display_backends, system_backends };
 	struct bus *b = &user_bus;
 	const char *env = getenv("DBUS_SESSION_BUS_ADDRESS");
-	int fd = -1;
+	bool ok = false;
 
 	if (b->tried)
 		return b->fd >= 0 ? b : NULL;
 	b->tried = true;
 
 	if (env && *env)
-		fd = addr_connect(env);
-	if (fd < 0) {
+		ok = bus_open(b, addr_connect(env));
+	if (!ok) {
 		char path[sizeof ((struct sockaddr_un *)0)->sun_path];
 		int n;
 
@@ -935,9 +1037,9 @@ static struct bus *get_user_bus(void)
 		else
 			n = snprintf(path, sizeof path, "/run/user/%lu/bus", (unsigned long)geteuid());
 		if (n > 0 && (size_t)n < sizeof path)
-			fd = unix_connect(path, (size_t)n, false);
+			ok = bus_open(b, unix_connect(path, (size_t)n, false));
 	}
-	if (!bus_open(b, fd)) {
+	if (!ok) {
 		DBG("Session-Bus: nicht erreichbar");
 		return NULL;
 	}
@@ -991,6 +1093,7 @@ static struct bus *get_sys_bus(void)
 static int logind_inhibit(const char *what)
 {
 	struct bus *b = get_sys_bus();
+	char why[sizeof reason + 64] = "";
 	int fd = -1;
 
 	if (!b) {
@@ -1003,7 +1106,16 @@ static int logind_inhibit(const char *what)
 			DBG("%s.Inhibit(%s) -> fd %d", seat_managers[i].iface, what, fd);
 			return fd;
 		}
+		/* gemeldet wird der Grund des Dienstes, den es gibt - nicht, dass der andere fehlt.
+		 * Ohne polkit lehnt logind jeden ausser root ab. */
+		if (failure != E_ABSENT && !*why)
+			snprintf(why, sizeof why, "%s%s", reason,
+			         failure == E_DENIED ? " (polkit fehlt oder erlaubt die Sperre nicht)" : "");
 	}
+	if (*why)
+		fail("%s", why);
+	else
+		fail("weder logind noch elogind oder ConsoleKit2 am System-Bus");
 	return -1;
 }
 
@@ -1024,6 +1136,9 @@ static bool sess_inhibit(const struct backend *list, struct assertion *a)
 			          "ss", NAME, details);
 		if (ok) {
 			a->be = be;
+			/* Besitzerwechsel, die waehrend des Aufrufs gemeldet wurden, sind
+			 * aelter als diese Antwort: die Sperre gilt beim jetzigen Besitzer */
+			a->stale = false;
 			DBG("%s.Inhibit -> cookie %u", be->iface, a->cookie);
 			return true;
 		}
@@ -1033,11 +1148,12 @@ static bool sess_inhibit(const struct backend *list, struct assertion *a)
 
 static void sess_uninhibit(struct assertion *a)
 {
-	if (!a->be)
+	const struct backend *be = a->be;	/* name_changed() kann a->be im Aufruf loeschen */
+
+	if (!be)
 		return;
-	call(&user_bus, false, a->be->dest, a->be->path, a->be->iface, a->be->uninhibit,
-	     0, NULL, "u", a->cookie);
-	DBG("%s.%s(%u)", a->be->iface, a->be->uninhibit, a->cookie);
+	call(&user_bus, false, be->dest, be->path, be->iface, be->uninhibit, 0, NULL, "u", a->cookie);
+	DBG("%s.%s(%u)", be->iface, be->uninhibit, a->cookie);
 	a->be = NULL;
 }
 
@@ -1050,6 +1166,215 @@ static void simulate_user_activity(void)
 		if (!be->gsm_flags &&
 		    call(b, false, be->dest, be->path, be->iface, "SimulateUserActivity", 0, NULL, ""))
 			break;
+}
+
+/* ---------------------------------------------------------------- X11 */
+
+/*
+ * Ohne Desktop-Dienst (i3, dwm, bspwm, Openbox ...) dunkelt der X-Server
+ * selbst ab: Bildschirmschoner-Timeout und DPMS. Beides ruht, solange ein
+ * Client es per MIT-SCREEN-SAVER "Suspend" verlangt, und lebt wieder auf,
+ * wenn dessen Verbindung endet - dasselbe Muster wie beim logind-fd.
+ * Auch das ohne Bibliothek: Verbindungsaufbau und eine Handvoll Requests,
+ * alles little-endian.
+ */
+
+#define X_COOKIE "MIT-MAGIC-COOKIE-1"
+
+struct xconn {
+	int fd;
+	long long deadline;
+	unsigned seq;			/* Nummer des letzten Requests */
+	unsigned watch;			/* Request ohne Antwort, dessen Fehler interessiert */
+	bool failed;			/* ... ist eingetroffen */
+};
+
+/* Feld einer Xauthority-Datei: Laenge (2 Bytes, big-endian), dann die Daten */
+static bool xau_field(FILE *f, unsigned char *buf, size_t max, size_t *len)
+{
+	int hi = getc(f), lo = getc(f);
+
+	if (hi == EOF || lo == EOF)
+		return false;
+	*len = (size_t)hi << 8 | (size_t)lo;
+	if (*len > max) {
+		/* passt nicht: ueberlesen, der Eintrag zaehlt als "kein Treffer" */
+		if (fseek(f, (long)*len, SEEK_CUR) < 0)
+			return false;
+		*len = SIZE_MAX;
+		return true;
+	}
+	return fread(buf, 1, *len, f) == *len;
+}
+
+/* Cookie fuer Display num aus $XAUTHORITY bzw. ~/.Xauthority; Laenge oder 0 */
+static size_t x11_cookie(const char *num, unsigned char *cookie, size_t max)
+{
+	const char *file = getenv("XAUTHORITY"), *home = getenv("HOME");
+	char path[PATH_MAX], host[256] = "";
+	unsigned char addr[256], number[16], name[32];
+	size_t alen, nlen, tlen, clen, found = 0;
+	FILE *f;
+
+	if (!file || !*file) {
+		if (!home || snprintf(path, sizeof path, "%s/.Xauthority", home) >= (int)sizeof path)
+			return 0;
+		file = path;
+	}
+	f = fopen(file, "re");
+	if (!f)
+		return 0;
+	gethostname(host, sizeof host - 1);
+	for (;;) {
+		int hi = getc(f), lo = getc(f);
+		unsigned family = (unsigned)hi << 8 | (unsigned)lo;
+
+		if (hi == EOF || lo == EOF ||
+		    !xau_field(f, addr, sizeof addr, &alen) || !xau_field(f, number, sizeof number, &nlen) ||
+		    !xau_field(f, name, sizeof name, &tlen) || !xau_field(f, cookie, max, &clen))
+			break;
+		/* Eintrag fuer diesen Rechner (256 = lokal) oder jeden (65535), dieses Display oder jedes */
+		if (tlen == strlen(X_COOKIE) && !memcmp(name, X_COOKIE, tlen) && clen > 0 && clen <= max &&
+		    (family == 65535 || (family == 256 && alen == strlen(host) && !memcmp(addr, host, alen))) &&
+		    (nlen == 0 || (nlen == strlen(num) && !memcmp(number, num, nlen)))) {
+			found = clen;
+			break;
+		}
+	}
+	fclose(f);
+	return found;
+}
+
+static bool x11_send(struct xconn *x, const void *req, size_t len)
+{
+	x->seq++;
+	return send_all(x->fd, req, len, x->deadline);
+}
+
+/*
+ * Pakete lesen bis zur Reaktion auf den letzten Request: 1 = Antwort (in
+ * pkt), 0 = Fehler, -1 = Verbindung weg oder Timeout. Nebenbei wird
+ * vermerkt, ob ein Fehler zum Request x->watch eintrifft.
+ */
+static int x11_wait(struct xconn *x, unsigned char pkt[32])
+{
+	for (;;) {
+		if (!recv_all(x->fd, pkt, 32, x->deadline))
+			return -1;
+
+		unsigned type = pkt[0], seq = pkt[2] | (unsigned)pkt[3] << 8;
+
+		if (type == 1 || (type & 0x7F) == 35) {
+			/* Antwort oder GenericEvent: Zusatzdaten in 4-Byte-Einheiten */
+			uint32_t extra = rd32(pkt + 4, false);
+
+			if (extra > 65536 || !recv_all(x->fd, NULL, (size_t)extra * 4, x->deadline))
+				return -1;
+		}
+		if (type == 0 && seq == (x->watch & 0xFFFF))
+			x->failed = true;
+		if (type <= 1 && seq == (x->seq & 0xFFFF))
+			return (int)type;
+	}
+}
+
+/* Opcode einer Erweiterung; 0, wenn der Server sie nicht hat */
+static unsigned x11_extension(struct xconn *x, const char *name)
+{
+	unsigned char req[8 + 32] = { 98 /* QueryExtension */ }, pkt[32];
+	size_t n = strlen(name), padded = (n + 3) & ~(size_t)3;
+
+	req[2] = (unsigned char)(2 + padded / 4);
+	req[4] = (unsigned char)n;
+	memcpy(req + 8, name, n);
+	if (!x11_send(x, req, 8 + padded) || x11_wait(x, pkt) != 1 || !pkt[8])
+		return 0;
+	return pkt[9];
+}
+
+/*
+ * Auf der frischen Verbindung fd anmelden (Cookie fuer Display num) und
+ * Bildschirmschoner samt DPMS aussetzen; wake (-u): vorher wie bei einer
+ * Eingabe den Bildschirm wecken.
+ */
+static bool x11_setup(int fd, const char *num, bool wake)
+{
+	static const unsigned char reset[4] = { 115 /* ForceScreenSaver */, 0 /* Reset */, 1 };
+	static const unsigned char sync[4] = { 43 /* GetInputFocus */, 0, 1 };
+	struct xconn x = { .fd = fd, .deadline = now_ms() + CALL_TIMEOUT_MS };
+	unsigned char setup[12 + 20 + 64] = { 'l', 0, 11 /* Protokoll 11.0 */ }, cookie[64], pkt[32];
+	size_t clen = x11_cookie(num, cookie, sizeof cookie), nlen = clen ? strlen(X_COOKIE) : 0, len = 12;
+	unsigned saver, dpms;
+
+	/* ohne Cookie entscheidet die Zugriffsliste des Servers */
+	setup[6] = (unsigned char)nlen;
+	setup[8] = (unsigned char)clen;
+	memcpy(setup + len, X_COOKIE, nlen);
+	len += (nlen + 3) & ~(size_t)3;
+	memcpy(setup + len, cookie, clen);
+	len += (clen + 3) & ~(size_t)3;
+	/* Antwort: Status, dann Zusatzdaten in 4-Byte-Einheiten (bei Erfolg die Beschreibung des Servers) */
+	if (!send_all(fd, setup, len, x.deadline) || !recv_all(fd, pkt, 8, x.deadline) ||
+	    !recv_all(fd, NULL, (size_t)(pkt[6] | pkt[7] << 8) * 4, x.deadline) || pkt[0] != 1) {
+		DBG("X11: Display :%s lehnt die Verbindung ab", num);
+		return false;
+	}
+
+	saver = x11_extension(&x, "MIT-SCREEN-SAVER");
+	if (!saver) {
+		DBG("X11: Server ohne MIT-SCREEN-SAVER");
+		return false;
+	}
+
+	const unsigned char suspend[8] = { (unsigned char)saver, 5 /* Suspend */, 2, 0, 1 /* True */ };
+
+	if (!x11_send(&x, suspend, sizeof suspend))
+		return false;
+	x.watch = x.seq;
+	if (wake && x11_send(&x, reset, sizeof reset) && (dpms = x11_extension(&x, "DPMS")) != 0) {
+		const unsigned char on[8] = { (unsigned char)dpms, 6 /* ForceLevel */, 2, 0, 0 /* On */ };
+
+		x11_send(&x, on, sizeof on);
+	}
+	/* Suspend hat keine Antwort: abwarten, bis der Server einen Request mit Antwort erledigt hat */
+	if (!x11_send(&x, sync, sizeof sync) || x11_wait(&x, pkt) != 1 || x.failed) {
+		DBG("X11: Bildschirmschoner laesst sich nicht aussetzen");
+		return false;
+	}
+	DBG("X11: Bildschirmschoner und DPMS auf Display :%s ausgesetzt", num);
+	return true;
+}
+
+/* Liefert den fd, dessen Verbindung Bildschirmschoner und DPMS aussetzt, oder -1 */
+static int x11_suspend(bool wake)
+{
+	const char *dpy = getenv("DISPLAY"), *wayland = getenv("WAYLAND_DISPLAY");
+	char num[8], path[32];
+	size_t n;
+	int fd;
+
+	/* Unter Wayland waere das Xwayland: Dessen Bildschirmschoner schaltet
+	 * nichts ab, und die Verbindung wuerde es womoeglich erst starten. */
+	if (!dpy || (wayland && *wayland))
+		return -1;
+	/* nur lokale Displays ":N" und ":N.S"; bei ssh -X stuende der Bildschirm woanders */
+	if (!strncmp(dpy, "unix", 4))
+		dpy += 4;
+	n = *dpy == ':' ? strspn(dpy + 1, "0123456789") : 0;
+	if (n == 0 || n >= sizeof num || (dpy[1 + n] != '\0' && dpy[1 + n] != '.'))
+		return -1;
+	memcpy(num, dpy + 1, n);
+	num[n] = '\0';
+	n = (size_t)snprintf(path, sizeof path, "/tmp/.X11-unix/X%s", num);
+	if ((fd = unix_connect(path, n, false)) < 0 && (fd = unix_connect(path, n, true)) < 0) {
+		DBG("X11: Display :%s nicht erreichbar", num);
+		return -1;
+	}
+	if (!x11_setup(fd, num, wake)) {
+		close(fd);
+		return -1;
+	}
+	return fd;
 }
 
 /* ---------------------------------------------------------------- Netzteil */
@@ -1071,12 +1396,40 @@ static bool read_sysfs(const char *dev, const char *attr, char *buf, size_t len)
 	return ok;
 }
 
+/* USB-C: Speist der Port gerade ein Geraet (Rolle "source"), ist er fuer uns keine Stromquelle */
+static bool usb_is_source(const char *dev)
+{
+	char path[PATH_MAX], buf[64];
+	bool source = false, sink = false;
+	struct dirent *e;
+	DIR *d;
+
+	snprintf(path, sizeof path, POWER_DIR "/%s/device/typec", dev);
+	d = opendir(path);
+	if (!d)
+		return false;
+	while ((e = readdir(d))) {
+		if (e->d_name[0] == '.')
+			continue;
+		snprintf(path, sizeof path, "%s/device/typec/%s", dev, e->d_name);
+		if (!read_sysfs(path, "power_role", buf, sizeof buf))
+			continue;
+		/* die aktive Rolle steht in Klammern: "[source] sink" */
+		if (strstr(buf, "[source]"))
+			source = true;
+		else if (strstr(buf, "[sink]"))
+			sink = true;
+	}
+	closedir(d);
+	return source && !sink;
+}
+
 /*
  * Wie on_ac_power() von systemd: am Netz, sobald eine Stromquelle online
  * meldet; sonst nur dann nicht, wenn ein Akku entlaedt. Ein Rechner ohne
  * Akku (Desktop) gilt also als "am Netz", auch wenn ein USB-C-Port als
- * Stromquelle offline meldet. Akkus von Peripherie (Maus, Tastatur) zaehlen
- * nicht.
+ * Stromquelle offline meldet. Akkus von Peripherie (Maus, Tastatur) und
+ * nicht eingesetzte zaehlen nicht.
  */
 static bool on_ac_power(void)
 {
@@ -1093,9 +1446,13 @@ static bool on_ac_power(void)
 		if (!strcmp(buf, "Battery")) {
 			if (read_sysfs(e->d_name, "scope", buf, sizeof buf) && !strcmp(buf, "Device"))
 				continue;
-			if (read_sysfs(e->d_name, "status", buf, sizeof buf) && !strcmp(buf, "Discharging"))
+			if (read_sysfs(e->d_name, "present", buf, sizeof buf) && !strcmp(buf, "0"))
+				continue;
+			/* ohne lesbaren Status wie systemd: vorsichtshalber "entlaedt" */
+			if (!read_sysfs(e->d_name, "status", buf, sizeof buf) || !strcmp(buf, "Discharging"))
 				discharging = true;
-		} else if (read_sysfs(e->d_name, "online", buf, sizeof buf) && strtoul(buf, NULL, 10) > 0) {
+		} else if (!(strncmp(buf, "USB", 3) == 0 && usb_is_source(e->d_name)) &&
+		           read_sysfs(e->d_name, "online", buf, sizeof buf) && strtoul(buf, NULL, 10) > 0) {
 			online = true;	/* 1 = fest, 2 = programmierbar (USB-PD) */
 		}
 	}
@@ -1142,12 +1499,16 @@ static bool create_one(int type, bool first)
 		if (first)
 			simulate_user_activity();
 		/* fall through */
-	case A_IDLE:
 	case A_DISPLAY:
+		/* die X11-Verbindung ueberdauert einen Neustart der Desktop-Dienste */
+		if (first)
+			a->xfd = x11_suspend(type == A_USER);
+		/* fall through */
+	case A_IDLE:
 		if (sess_inhibit(backends_for(type), a))
 			return true;
 		a->fd = logind_inhibit("idle");
-		return a->fd >= 0;
+		return a->fd >= 0 || a->xfd >= 0;
 	case A_SYSTEM:
 		/* Akkubetrieb: Assertion gilt, wirkt aber erst am Netzteil */
 		if (!get_sys_bus()) {
@@ -1170,7 +1531,9 @@ static void release_one(int type)
 		return;
 	if (a->fd >= 0)
 		close(a->fd);
-	a->fd = -1;
+	if (a->xfd >= 0)
+		close(a->xfd);
+	a->fd = a->xfd = -1;
 	sess_uninhibit(a);
 	a->active = a->stale = false;
 	DBG("%s freigegeben", type_name[type]);
@@ -1252,11 +1615,21 @@ static void refresh_assertions(void)
 		if (!a->active || !a->stale)
 			continue;
 		a->stale = false;
-		if (!create_one(i, false))
-			DBG("%s: zurzeit keine Sperre moeglich", type_name[i]);
-		/* Ersatzsperre erst jetzt freigeben, damit keine Luecke entsteht */
-		if (old_fd >= 0)
-			close(old_fd);
+		create_one(i, false);
+		if (a->be || a->fd >= 0) {
+			/* Ersatzsperre erst jetzt freigeben, damit keine Luecke entsteht */
+			if (old_fd >= 0)
+				close(old_fd);
+			a->lost = false;
+		} else {
+			/* nichts Neues bekommen: die alte Ersatzsperre gilt weiter */
+			a->fd = old_fd;
+			if (old_fd < 0 && a->xfd < 0 && !a->lost) {
+				fprintf(stderr, NAME ": %s: Sperre verloren%s%s\n", type_name[i],
+				        *reason ? ": " : "", reason);
+				a->lost = true;
+			}
+		}
 		if (!a->be && follow_up)
 			a->stale = again = true;
 	}
@@ -1264,17 +1637,9 @@ static void refresh_assertions(void)
 		refresh_at = now_ms() + RETRY_MS;
 }
 
-/* Eingegangenes vom Session-Bus abarbeiten, ohne zu warten */
-static void sess_dispatch(void)
+/* Der Session-Bus ist weg (abgemeldet): Die Sperren dort gibt es nicht mehr */
+static void sess_gone(void)
 {
-	struct message m;
-	int r;
-
-	while ((r = bus_next(&user_bus, 0, &m)) > 0)
-		bus_other(&user_bus, &m);
-	if (r == 0)
-		return;
-	/* Bus weg (abgemeldet): die Sperren dort gibt es nicht mehr */
 	for (int i = 0; i < A_COUNT; i++) {
 		if (as[i].active && as[i].be) {
 			as[i].be = NULL;
@@ -1283,6 +1648,54 @@ static void sess_dispatch(void)
 			refresh_at = 0;
 		}
 	}
+}
+
+/* Eingegangenes vom Session-Bus abarbeiten, ohne zu warten */
+static void sess_dispatch(void)
+{
+	struct message m;
+	int r = 0;
+
+	/* in Portionen: Signale und Fristen der Hauptschleife kommen auch bei einer Flut dran */
+	for (int n = 0; n < 32 && (r = bus_next(&user_bus, 0, &m)) > 0; n++)
+		bus_other(&user_bus, &m);
+	if (r < 0)
+		sess_gone();
+}
+
+/* -w ohne pidfd: Gibt es den Prozess noch? Ein Zombie zaehlt als beendet. */
+static bool pid_alive(pid_t pid)
+{
+	char path[64], buf[512];
+	const char *end;
+	size_t n;
+	FILE *f;
+
+	if (kill(pid, 0) < 0 && errno == ESRCH)
+		return false;
+	snprintf(path, sizeof path, "/proc/%ld/stat", (long)pid);
+	f = fopen(path, "re");
+	if (!f)
+		return true;
+	n = fread(buf, 1, sizeof buf - 1, f);
+	fclose(f);
+	buf[n] = '\0';
+	/* "PID (Name) Zustand ..."; der Name kann selbst Klammern enthalten */
+	end = strrchr(buf, ')');
+	return !(end && end[1] == ' ' && (end[2] == 'Z' || end[2] == 'X'));
+}
+
+/*
+ * Signal ueber das signalfd abholen - es sei denn, es wird ignoriert (nohup,
+ * Hintergrundjob einer Shell ohne Jobkontrolle). Blockiert kaeme es dort
+ * trotzdem an, und caffeinate endete, obwohl das command weiterlaeuft.
+ */
+static void watch_signal(sigset_t *mask, int sig)
+{
+	struct sigaction sa;
+
+	if (sigaction(sig, NULL, &sa) < 0 || sa.sa_handler != SIG_IGN)
+		sigaddset(mask, sig);
 }
 
 /* ---------------------------------------------------------------- main */
@@ -1308,6 +1721,8 @@ int main(int argc, char **argv)
 	int ch;
 
 	debug = env && *env && strcmp(env, "0") != 0;
+	for (int i = 0; i < A_COUNT; i++)
+		as[i].fd = as[i].xfd = -1;
 
 	/* '+': wie BSD-getopt beim ersten Nicht-Flag aufhoeren; ':' + opterr = 0:
 	 * Meldungen im BSD-Wortlaut statt glibc/musl */
@@ -1354,8 +1769,8 @@ int main(int argc, char **argv)
 
 	sigset_t mask, oldmask;
 	sigemptyset(&mask);
-	sigaddset(&mask, SIGTERM);
-	sigaddset(&mask, SIGHUP);
+	watch_signal(&mask, SIGTERM);
+	watch_signal(&mask, SIGHUP);
 
 	int pfd = -1;		/* Prozess, auf dessen Ende gewartet wird */
 	pid_t pid_poll = 0;	/* -w ohne pidfd: per kill(pid, 0) abfragen */
@@ -1397,8 +1812,8 @@ int main(int argc, char **argv)
 		snprintf(details, sizeof details,
 		         "caffeinate asserting on behalf of '%s' (pid %d)", *argv, (int)parent);
 	} else {
-		sigaddset(&mask, SIGINT);
-		sigaddset(&mask, SIGQUIT);
+		watch_signal(&mask, SIGINT);
+		watch_signal(&mask, SIGQUIT);
 		sigprocmask(SIG_BLOCK, &mask, &oldmask);
 		deadline = expiry_after(timeout);
 		if (waitforpid) {
@@ -1439,9 +1854,10 @@ int main(int argc, char **argv)
 	int exit_code = EXIT_SUCCESS, term_sig = 0;
 
 	for (;;) {
-		/* auch das, was beim letzten Aufruf schon mit im Puffer gelandet ist */
 		if (user_bus.fd >= 0)
 			sess_dispatch();
+		else
+			sess_gone();	/* der Bus kann auch mitten in einem Aufruf gestorben sein */
 		if (refresh_at != FOREVER && refresh_at <= now_ms()) {
 			refresh_at = FOREVER;
 			refresh_assertions();
@@ -1467,7 +1883,7 @@ int main(int argc, char **argv)
 				next = now + AC_POLL_MS;
 		}
 		if (pid_poll) {
-			if (kill(pid_poll, 0) < 0 && errno == ESRCH)
+			if (!pid_alive(pid_poll))
 				break;
 			if (next == FOREVER || now + PID_POLL_MS < next)
 				next = now + PID_POLL_MS;

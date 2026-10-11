@@ -5,7 +5,13 @@ BINDIR  ?= $(PREFIX)/bin
 MANDIR  ?= $(PREFIX)/share/man/man8
 
 CC      ?= cc
-CFLAGS  ?= -O2 -g
+
+# Haertung, soweit der Compiler sie kennt. Wer CFLAGS und LDFLAGS selbst setzt
+# (Distro-Pakete), bringt seine eigene mit. _FORTIFY_SOURCE setzt caffeinate.c.
+HARDEN  := $(shell for f in -fstack-protector-strong -fPIE; do \
+		$(CC) $$f -E -x c /dev/null >/dev/null 2>&1 && printf '%s ' $$f; done)
+CFLAGS  ?= -O2 -g $(HARDEN)
+LDFLAGS ?= -pie -Wl,-z,relro,-z,now
 
 # override: auch bei CFLAGS=... von der Kommandozeile (Distro-Pakete, asan)
 override CFLAGS += -std=c11 -Wall -Wextra -Wpedantic
@@ -18,16 +24,19 @@ caffeinate: caffeinate.c
 
 # -B: immer neu bauen, auch wenn schon ein normales Binary daliegt
 asan:
-	$(MAKE) -B caffeinate CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
-		LDFLAGS="-fsanitize=address,undefined"
+	$(MAKE) -B caffeinate CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+		-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0" LDFLAGS="-fsanitize=address,undefined"
 
-# ein Binary fuer jede Distribution; braucht die statische libc (musl oder glibc-static)
+# ein Binary fuer jede Distribution; braucht die statische libc (musl oder glibc-static).
+# Als static-pie, wo die Toolchain das kann, sonst klassisch statisch.
 static:
+	$(MAKE) -B caffeinate CFLAGS="-O2 $(HARDEN)" LDFLAGS="-static-pie -s -Wl,-z,relro,-z,now" || \
 	$(MAKE) -B caffeinate CFLAGS="-O2" LDFLAGS="-static -s"
 
 test: caffeinate
 	sh tests/smoke.sh ./caffeinate
 	sh tests/dbus.sh ./caffeinate
+	sh tests/x11.sh ./caffeinate
 
 install: caffeinate
 	install -Dm755 caffeinate $(DESTDIR)$(BINDIR)/caffeinate

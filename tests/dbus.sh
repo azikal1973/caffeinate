@@ -171,14 +171,14 @@ if printf '#!/bin/sh\nexit 0\n' > "$latin" 2>/dev/null && chmod +x "$latin"; the
 fi
 stop "$m"
 
-# uebergrosse fremde Nachricht vor der Antwort
+# fremde Nachrichten vor der Antwort, eine davon uebergross
 : > "$LOG"
 mock session pm noisy
 m=$mock_pid
 "$C" -i -t 1
-check "fremdes 20-kB-Signal: Exit 0" 0 "$?"
-has "fremdes 20-kB-Signal: Sperre trotzdem angelegt" "^pm .* Inhibit cookie=1 "
-has "fremdes 20-kB-Signal: und freigegeben" "^pm .* UnInhibit 1\$"
+check "fremde Signale vor der Antwort: Exit 0" 0 "$?"
+has "fremde Signale vor der Antwort: Sperre trotzdem angelegt" "^pm .* Inhibit cookie=1 "
+has "fremde Signale vor der Antwort: und freigegeben" "^pm .* UnInhibit 1\$"
 stop "$m"
 
 : > "$LOG"
@@ -189,17 +189,27 @@ has "-d: Dienst nur unter /ScreenSaver" "^ss-legacy /ScreenSaver Inhibit "
 stop "$m"
 
 # ---------------------------------------------------------------- XFCE
+# xfce4-power-manager haelt, solange es gesperrt ist, DPMS und Bildschirmschoner
+# selbst an; org.xfce.ScreenSaver direkt zaehlt nur, wenn der Power-Manager fehlt
 : > "$LOG"
-mock session pm xfss
+mock session xfpm xfss
 m=$mock_pid
 "$C" -i -d -u -t 1
-has "XFCE -i: xfce4-power-manager" "^pm /org/freedesktop/PowerManagement/Inhibit Inhibit "
-has "XFCE -d: xfce4-screensaver" "^xfss /org/xfce/ScreenSaver Inhibit cookie=[0-9]* app=caffeinate "
-has "XFCE -u: SimulateUserActivity" "^xfss /org/xfce/ScreenSaver SimulateUserActivity"
+check "XFCE -i, -d, -u: drei Sperren bei xfce4-power-manager" 3 "$(lines '^xfpm /org/freedesktop/PowerManagement/Inhibit Inhibit ')"
+hasnt "XFCE -d: nicht nur der Bildschirmschoner" "^xfss .* Inhibit "
+has "XFCE -u: SimulateUserActivity beim Bildschirmschoner" "^xfss /org/xfce/ScreenSaver SimulateUserActivity"
 check "XFCE: alle drei freigegeben" 3 "$(lines ' UnInhibit ')"
 stop "$m"
 
+: > "$LOG"
+mock session xfss
+m=$mock_pid
+"$C" -d -t 1
+has "XFCE ohne Power-Manager -d: xfce4-screensaver" "^xfss /org/xfce/ScreenSaver Inhibit cookie=[0-9]* app=caffeinate "
+stop "$m"
+
 # ---------------------------------------------------------------- GNOME, Cinnamon, MATE
+# alle drei melden ihren Session-Manager als org.gnome.SessionManager
 : > "$LOG"
 mock session gsm
 m=$mock_pid
@@ -207,13 +217,6 @@ m=$mock_pid
 has "GNOME -i: SessionManager, Flag suspend" "^gsm /org/gnome/SessionManager Inhibit cookie=[0-9]* app=caffeinate xid=0 flags=4 reason=caffeinate asserting for 1 secs\$"
 has "GNOME -d: SessionManager, Flag idle" "^gsm .* Inhibit .* flags=8 "
 check "GNOME: beide freigegeben" 2 "$(lines ' Uninhibit ')"
-stop "$m"
-
-: > "$LOG"
-mock session mate
-m=$mock_pid
-"$C" -i -t 1
-has "MATE -i: SessionManager, Flag suspend" "^mate /org/mate/SessionManager Inhibit .* flags=4 "
 stop "$m"
 
 : > "$LOG"
@@ -236,6 +239,38 @@ has "ohne Desktop-Dienst: fd am Ende geschlossen" "^login1 released idle\$"
 DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent "$C" -d -t 1
 has "ohne Session-Bus: logind idle" "^login1 Inhibit what=idle "
 has "ohne Session-Bus: fd am Ende geschlossen" "^login1 released idle\$"
+
+# ---------------------------------------------------------------- ignorierte Signale (nohup)
+: > "$LOG"
+mock session pm
+m=$mock_pid
+(trap '' HUP; exec "$C" -i -t 3) &
+cpid=$!
+pids="$pids $cpid"
+has "nohup: Sperre angelegt" "^pm .* Inhibit "
+kill -HUP "$cpid"
+sleep 0.5
+hasnt "nohup: SIGHUP gibt die Sperre nicht frei" " UnInhibit "
+wait "$cpid"
+check "nohup: laeuft bis zum Timeout, Exit 0" 0 "$?"
+
+# mit command: der Hilfsprozess muss das SIGHUP ebenso ueberstehen wie das command
+: > "$LOG"
+(trap '' HUP; exec "$C" -i sleep 3) &
+cpid=$!
+pids="$pids $cpid"
+has "nohup mit command: Sperre angelegt" "^pm .* Inhibit "
+helper=
+for stat in /proc/[0-9]*/stat; do
+	read -r pid _ _ ppid _ < "$stat" 2>/dev/null || continue
+	[ "$ppid" = "$cpid" ] && helper=$pid
+done
+kill -HUP "$helper" "$cpid" 2>/dev/null
+sleep 0.5
+hasnt "nohup mit command: SIGHUP gibt die Sperre nicht frei" " UnInhibit "
+wait "$cpid"
+has "nohup mit command: Freigabe erst mit dem Ende des command" " UnInhibit "
+stop "$m"
 
 # ---------------------------------------------------------------- Dienst startet neu
 : > "$LOG"
@@ -261,6 +296,20 @@ check "SIGTERM: Exit durch das Signal" 143 "$?"
 has "SIGTERM: Sperre vorher freigegeben" "^pm .* UnInhibit 1\$"
 hasnt "Neustart: altes Cookie wird nicht mehr benutzt" " UnInhibit 7\$"
 stop "$m"
+
+# der Dienst endet unmittelbar vor caffeinate (Abmelden): kein Absturz, auch nicht mit Debug-Ausgabe
+: > "$LOG"
+mock session pm
+m=$mock_pid
+CAFFEINATE_DEBUG=1 "$C" -i 2>/dev/null &
+cpid=$!
+pids="$pids $cpid"
+has "Dienst endet kurz vor caffeinate: Sperre beim Dienst" "^pm .* Inhibit "
+kill "$m"
+kill -TERM "$cpid"
+wait "$cpid"
+check "Dienst endet kurz vor caffeinate: Exit durch SIGTERM" 143 "$?"
+wait "$m" 2>/dev/null
 
 # der Session-Bus selbst endet (Abmeldung)
 : > "$LOG"
@@ -290,11 +339,11 @@ P=$T/power
 mkdir "$P"
 # shellcheck disable=SC2016
 if [ -n "$UNSHARE" ] && $UNSHARE sh -c 'mount --bind "$1" /sys/class/power_supply' sh "$P" 2>/dev/null; then
-	dev() {	# Name, Attribut=Wert...
+	dev() {	# Name, Attribut=Wert... (Attribut auch mit Unterverzeichnis)
 		d=$P/$1
-		mkdir -p "$d"
 		shift
 		for kv; do
+			mkdir -p "$(dirname "$d/${kv%%=*}")"
 			printf '%s\n' "${kv#*=}" > "$d/${kv%%=*}"
 		done
 	}
@@ -323,6 +372,15 @@ if [ -n "$UNSHARE" ] && $UNSHARE sh -c 'mount --bind "$1" /sys/class/power_suppl
 	dev AC type=Mains online=0
 	dev hidpp_battery_0 type=Battery scope=Device status=Discharging
 	power "nur der Akku einer Maus entlaedt: Sperre" 1
+	dev AC type=Mains online=0
+	dev BAT1 type=Battery present=0 status=Discharging
+	power "leerer Akkuschacht: Sperre" 1
+	dev ucsi-source-psy-USBC000:001 type=USB online=1 'device/typec/port0/power_role=[source] sink'
+	dev BAT0 type=Battery status=Discharging
+	power "Akkubetrieb, der USB-C-Port speist ein Geraet: keine Sperre" 0
+	dev ucsi-source-psy-USBC000:001 type=USB online=1 'device/typec/port0/power_role=source [sink]'
+	dev BAT0 type=Battery status=Charging
+	power "USB-C-Port wird gespeist: Sperre" 1
 
 	# Netzteil wird im Betrieb gezogen
 	: > "$LOG"
@@ -348,6 +406,21 @@ else
 fi
 stop "$ml"
 
+# fremde Signale mit fds direkt vor der Antwort von logind: caffeinate muss
+# den fd der Sperre halten, nicht einen der fremden
+: > "$LOG"
+mock system login1 noisy
+m=$mock_pid
+"$C" -i -t 2 &
+cpid=$!
+pids="$pids $cpid"
+has "fremde fds vor der Antwort: Sperre bei logind" "^login1 Inhibit what=idle "
+sleep 1
+hasnt "fremde fds vor der Antwort: Sperre haelt, solange caffeinate laeuft" "^login1 released"
+wait "$cpid"
+has "fremde fds vor der Antwort: am Ende freigegeben" "^login1 released idle\$"
+stop "$m"
+
 # ---------------------------------------------------------------- ConsoleKit2, gar nichts
 : > "$LOG"
 mock system ck
@@ -359,7 +432,16 @@ stop "$m"
 
 out=$("$C" -i -t 1 2>&1)
 check "keine Sperre moeglich: Exit 1" 1 "$?"
+check "keine Sperre moeglich: Grund" "caffeinate: weder logind noch elogind oder ConsoleKit2 am System-Bus" "$(echo "$out" | head -n 1)"
 check "keine Sperre moeglich: Meldung" "Failed to create PreventUserIdleSystemSleep assertion" "$(echo "$out" | tail -n 1)"
+
+# logind ohne polkit lehnt jeden ausser root ab: das soll in der Meldung stehen, nicht das fehlende ConsoleKit
+mock system login1-denied
+m=$mock_pid
+out=$("$C" -i -t 1 2>&1)
+check "logind lehnt ab: Exit 1" 1 "$?"
+check "logind lehnt ab: Grund" "caffeinate: org.freedesktop.login1.Manager.Inhibit: Permission denied (polkit fehlt oder erlaubt die Sperre nicht)" "$(echo "$out" | head -n 1)"
+stop "$m"
 
 out=$(DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent "$C" -s -t 1 2>&1)
 check "-s ohne System-Bus: Exit 1" 1 "$?"

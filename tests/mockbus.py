@@ -5,25 +5,31 @@
 #
 # Verbindet sich mit dem Bus aus DBUS_SESSION_BUS_ADDRESS und schreibt jeden
 # Aufruf als Zeile ins Protokoll. Dienste:
-#   pm         org.freedesktop.PowerManagement (KDE, XFCE)
+#   pm         org.freedesktop.PowerManagement (PowerDevil von KDE)
+#   xfpm       dasselbe, zusaetzlich unter org.xfce.PowerManager (xfce4-power-manager)
 #   ss         org.freedesktop.ScreenSaver unter beiden Pfaden
 #   ss-legacy  org.freedesktop.ScreenSaver nur unter /ScreenSaver
 #   ss-broken  wie ss, aber Inhibit antwortet mit einem Fehler
 #   xfss       org.xfce.ScreenSaver
-#   gsm        org.gnome.SessionManager
-#   mate       org.mate.SessionManager
+#   gsm        org.gnome.SessionManager (GNOME, Cinnamon, MATE)
 #   login1     org.freedesktop.login1 (Inhibit liefert einen fd)
+#   login1-denied  wie login1, aber Inhibit wird abgelehnt (logind ohne polkit)
 #   ck         org.freedesktop.ConsoleKit (ebenso)
-#   noisy      kein Dienst: vor jeder Antwort ein uebergrosses Signal an den Aufrufer
+#   noisy      kein Dienst: vor jeder Antwort fremde Signale an den Aufrufer, ein kleines
+#              und ein uebergrosses, beide mit fds im Gepaeck
 # MOCK_COOKIE legt das erste vergebene Cookie fest (Standard 1).
 import itertools
 import os
 import sys
+import warnings
 
 import gi
 
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
+
+# neuere PyGObject-Versionen raten von register_object ab, aeltere kennen nichts anderes
+warnings.simplefilter("ignore", DeprecationWarning)
 
 FDO_XML = """<node><interface name='%s'>
   <method name='Inhibit'>
@@ -31,6 +37,13 @@ FDO_XML = """<node><interface name='%s'>
   </method>
   <method name='UnInhibit'><arg type='u' direction='in'/></method>
   <method name='SimulateUserActivity'/>
+</interface></node>"""
+
+PM_XML = """<node><interface name='%s'>
+  <method name='Inhibit'>
+    <arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='u' direction='out'/>
+  </method>
+  <method name='UnInhibit'><arg type='u' direction='in'/></method>
 </interface></node>"""
 
 GSM_XML = """<node><interface name='%s'>
@@ -52,19 +65,21 @@ FDO_SS = "org.freedesktop.ScreenSaver"
 FDO_PM = "org.freedesktop.PowerManagement"
 XFCE_SS = "org.xfce.ScreenSaver"
 
-# Dienst -> (Busname, Schnittstelle, XML, Pfade)
+# Dienst -> (Busnamen, Schnittstelle, XML, Pfade)
 SERVICES = {
-    "pm": (FDO_PM, FDO_PM + ".Inhibit", FDO_XML, ["/org/freedesktop/PowerManagement/Inhibit"]),
+    "pm": (FDO_PM, FDO_PM + ".Inhibit", PM_XML, ["/org/freedesktop/PowerManagement/Inhibit"]),
+    "xfpm": ("org.xfce.PowerManager " + FDO_PM, FDO_PM + ".Inhibit", PM_XML,
+             ["/org/freedesktop/PowerManagement/Inhibit"]),
     "ss": (FDO_SS, FDO_SS, FDO_XML, ["/org/freedesktop/ScreenSaver", "/ScreenSaver"]),
     "ss-legacy": (FDO_SS, FDO_SS, FDO_XML, ["/ScreenSaver"]),
     "ss-broken": (FDO_SS, FDO_SS, FDO_XML, ["/org/freedesktop/ScreenSaver", "/ScreenSaver"]),
     "xfss": (XFCE_SS, XFCE_SS, FDO_XML, ["/org/xfce/ScreenSaver"]),
     "gsm": ("org.gnome.SessionManager", "org.gnome.SessionManager", GSM_XML,
             ["/org/gnome/SessionManager"]),
-    "mate": ("org.mate.SessionManager", "org.mate.SessionManager", GSM_XML,
-             ["/org/mate/SessionManager"]),
     "login1": ("org.freedesktop.login1", "org.freedesktop.login1.Manager", SEAT_XML,
                ["/org/freedesktop/login1"]),
+    "login1-denied": ("org.freedesktop.login1", "org.freedesktop.login1.Manager", SEAT_XML,
+                      ["/org/freedesktop/login1"]),
     "ck": ("org.freedesktop.ConsoleKit", "org.freedesktop.ConsoleKit.Manager", SEAT_XML,
            ["/org/freedesktop/ConsoleKit/Manager"]),
 }
@@ -85,13 +100,30 @@ def released(fd, _condition, tag, what):
     return False
 
 
+def noise(conn, destination, text, fd_count):
+    message = Gio.DBusMessage.new_signal("/mock", "org.example.Mock", "Noise")
+    message.set_destination(destination)
+    message.set_body(GLib.Variant("(s)", (text,)))
+    fds = Gio.UnixFDList.new()
+    for _ in range(fd_count):
+        r, w = os.pipe()
+        fds.append(w)
+        os.close(r)
+        os.close(w)
+    message.set_unix_fd_list(fds)
+    conn.send_message(message, Gio.DBusSendMessageFlags.NONE)
+
+
 def make_handler(tag):
     def handler(conn, sender, path, _iface, method, params, invocation):
         args = params.unpack()
         if noisy:
-            conn.emit_signal(sender, "/mock", "org.example.Mock", "Noise",
-                             GLib.Variant("(s)", ("x" * 20000,)))
-        if tag in ("login1", "ck"):
+            noise(conn, sender, "x", 2)
+            noise(conn, sender, "x" * 20000, 4)
+        if tag == "login1-denied":
+            out(tag, "Inhibit-abgelehnt", args[0])
+            invocation.return_dbus_error("org.freedesktop.DBus.Error.AccessDenied", "Permission denied")
+        elif tag in ("login1", "ck"):
             # wie logind: der Aufrufer bekommt das Schreibende, wir sehen sein Ende
             what, who, why, mode = args
             r, w = os.pipe()
@@ -124,10 +156,14 @@ conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
 for tag in wanted:
     if tag == "noisy":
         continue
-    name, iface, xml, paths = SERVICES[tag]
+    names, iface, xml, paths = SERVICES[tag]
     info = Gio.DBusNodeInfo.new_for_xml(xml % iface).interfaces[0]
     for path in paths:
         conn.register_object(path, info, make_handler(tag), None, None)
-    Gio.bus_own_name_on_connection(conn, name, Gio.BusNameOwnerFlags.NONE,
-                                   lambda _c, _n, tag=tag: out("ready", tag), None)
+    names = names.split()
+    for name in names:
+        # "ready" erst, wenn der letzte Name vergeben ist
+        Gio.bus_own_name_on_connection(
+            conn, name, Gio.BusNameOwnerFlags.NONE,
+            (lambda _c, _n, tag=tag: out("ready", tag)) if name == names[-1] else None, None)
 GLib.MainLoop().run()

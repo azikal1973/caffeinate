@@ -2,6 +2,10 @@
 # Smoke-Test ohne D-Bus (laeuft auch in CI-Containern):
 # Optionen, Meldungen und Exit-Codes wie bei Apples caffeinate.
 C=${1:-./caffeinate}
+# auch auf einem Desktop keine echten Sperren anlegen
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent
+export XDG_RUNTIME_DIR=/nonexistent
+unset DISPLAY WAYLAND_DISPLAY
 USAGE='usage: caffeinate [-disu] [-t timeout] [-w Process ID] [command arguments...]'
 fail=0
 

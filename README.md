@@ -63,12 +63,46 @@ Mit glibc statisch gelinkt, verlangt das Binary mindestens den Kernel, für den 
 Distribution gebaut wurde. Mit musl gibt es diese Grenze nicht, deshalb entstehen die Binaries der
 Releases unter Alpine.
 
+Gebaut wird mit Stack-Protector, PIE, vollem RELRO und `_FORTIFY_SOURCE`, soweit der Compiler das
+kennt. Wer `CFLAGS` und `LDFLAGS` selbst setzt (Distro-Pakete), bestimmt das selbst.
+
+### NixOS
+
+Ein fremdes, dynamisch gelinktes Binary startet auf NixOS nicht, das statische aus den Releases
+schon. Als Paket gibt es caffeinate über das Flake dieses Repos:
+
+```sh
+nix run github:azikal1973/caffeinate -- -i make     # einmalig ausführen
+nix profile install github:azikal1973/caffeinate    # für dich installieren
+```
+
+In der Systemkonfiguration: `inputs.caffeinate.url = "github:azikal1973/caffeinate";` und dann
+`environment.systemPackages = [ inputs.caffeinate.packages.${pkgs.stdenv.hostPlatform.system}.default ];`.
+Ohne Flakes geht `pkgs.callPackage ./package.nix { }`. `packages.static` ist die statisch gelinkte
+Variante, `nix develop -c make test` baut und testet mit allem, was die Tests brauchen.
+
+Ohne Desktop (TTY, SSH) und unter Fenstermanagern ohne eigenen Energiedienst hält logind die Sperre.
+logind fragt dafür polkit, und ohne polkit lehnt es jeden außer root ab. Die Desktop-Module von NixOS
+schalten polkit ein, eine schlanke Konfiguration braucht `security.polkit.enable = true;`.
+
+### Void Linux
+
+```sh
+sudo xbps-install -S gcc make
+make && sudo make install PREFIX=/usr/local
+```
+
+Das fertige Binary läuft unter glibc und musl. Für die Sperren bei elogind müssen die Dienste `dbus`
+und `elogind` laufen und das Paket `polkit` installiert sein (D-Bus startet polkitd bei Bedarf). Ohne
+polkit lehnt elogind jeden außer root ab, caffeinate meldet dann
+`Permission denied (polkit fehlt oder erlaubt die Sperre nicht)`.
+
 ## Linux-Umsetzung
 
 | Flag | macOS-Assertion | Linux |
 |---|---|---|
-| `-i` | PreventUserIdleSystemSleep (Standard) | `org.freedesktop.PowerManagement.Inhibit` (KDE, XFCE), sonst GNOME/MATE-SessionManager (Flag suspend) |
-| `-d` | PreventUserIdleDisplaySleep | `org.freedesktop.ScreenSaver.Inhibit`, sonst `org.xfce.ScreenSaver` oder GNOME/MATE-SessionManager (Flag idle) |
+| `-i` | PreventUserIdleSystemSleep (Standard) | `org.freedesktop.PowerManagement.Inhibit` (KDE, XFCE), sonst `org.gnome.SessionManager` (Flag suspend) |
+| `-d` | PreventUserIdleDisplaySleep | `org.freedesktop.ScreenSaver.Inhibit`, auf XFCE xfce4-power-manager, sonst `org.gnome.SessionManager` (Flag idle) |
 | `-s` | PreventSystemSleep (nur am Netzteil) | logind-Inhibitor `sleep`, nur am Netz |
 | `-u` | UserIsActive (Standard-Timeout 5 s) | `ScreenSaver.SimulateUserActivity` + wie `-d` |
 | `-m` | PreventDiskIdle | kein Gegenstück, ohne Wirkung |
@@ -77,14 +111,23 @@ Ohne Session-Bus (TTY, SSH) oder ohne passenden Desktop-Dienst fallen `-i`, `-d`
 logind-Inhibitor `idle` zurück. Desktop-Dienste werden nie per D-Bus-Aktivierung gestartet, es werden
 nur laufende genutzt.
 
+In einer X11-Sitzung setzen `-d` und `-u` zusätzlich den Bildschirmschoner und DPMS des X-Servers aus
+(Erweiterung MIT-SCREEN-SAVER). Das wirkt auch ganz ohne Desktop-Dienst, etwa unter i3, dwm oder bspwm,
+und endet mit der Sperre. `-u` beendet dabei einen laufenden Bildschirmschoner und schaltet den
+Bildschirm ein. Programme, die dem Bildschirmschoner des Servers folgen (xss-lock), bleiben damit
+ebenfalls ruhig. Programme, die die Leerlaufzeit selbst messen (xautolock, xidlehook), bemerken davon
+nichts. Unter Wayland wird der X-Server nicht benutzt.
+
 Startet ein Desktop-Dienst neu (etwa PowerDevil nach einem Absturz), ist die Sperre dort verloren.
 caffeinate bemerkt das und legt sie neu an. Solange der Dienst fehlt, hält logind eine Ersatzsperre.
-Dasselbe gilt, wenn der Dienst erst nach caffeinate startet oder der Session-Bus endet.
+Dasselbe gilt, wenn der Dienst erst nach caffeinate startet oder der Session-Bus endet. Lässt sich
+eine verlorene Sperre nirgends ersetzen, meldet caffeinate das einmal auf stderr und läuft weiter.
 
 Ob der Rechner am Netz hängt, entscheidet `-s` wie systemd: Eine Stromquelle meldet `online`, oder
-kein Akku entlädt sich. Der Status wird alle 5 Sekunden geprüft.
+kein Akku entlädt sich. Ein USB-C-Port, der selbst ein Gerät speist, zählt nicht als Stromquelle. Der
+Status wird alle 5 Sekunden geprüft.
 
-D-Bus spricht caffeinate direkt auf dem Socket, libdbus wird nicht gebraucht.
+D-Bus und X11 spricht caffeinate direkt auf dem Socket, libdbus und Xlib werden nicht gebraucht.
 
 ## Verhalten wie auf macOS
 
@@ -97,6 +140,8 @@ Wo Apples Manpage und Apples Code sich widersprechen, folgt dieser Nachbau dem C
 - `-u` ohne `-t`: Die Sperre endet nach 5 s, caffeinate läuft aber weiter, bis es beendet wird.
 - `-w` mit nicht existierender PID beendet sofort. `-w` wird ignoriert, wenn ein command angegeben ist.
 - Mit command wird caffeinate per exec selbst zum command. PID, Exit-Status und Signale sind die des commands. Ein Hilfsprozess hält die Sperren, ignoriert SIGINT und SIGQUIT und endet mit dem command.
+- Ignorierte Signale bleiben ignoriert: `nohup caffeinate …` übersteht das Schließen des Terminals.
+- Schlägt `fork` fehl, läuft das command trotzdem, nur ohne Sperren.
 - Lässt sich eine Sperre nicht anlegen: `Failed to create <Typ> assertion`, Exit 1. Davor steht eine Zeile mit dem Grund.
 - Die Meldungen sind im BSD-Wortlaut: `illegal option -- x`, `option requires an argument -- t`.
 
@@ -104,43 +149,52 @@ Wo Apples Manpage und Apples Code sich widersprechen, folgt dieser Nachbau dem C
 
 | Umgebung | Status |
 |---|---|
-| KDE Plasma | getestet |
-| GNOME, Cinnamon | über `org.gnome.SessionManager` (gegen Mock-Dienst getestet) |
-| MATE | über `org.mate.SessionManager` (gegen Mock-Dienst getestet) |
-| XFCE | über xfce4-power-manager und xfce4-screensaver (gegen Mock-Dienst getestet) |
+| KDE Plasma | getestet; PowerDevil setzt eine Sperre erst 5 s nach der Anforderung durch |
+| GNOME, Cinnamon, MATE | über `org.gnome.SessionManager`, `-d` über dessen ScreenSaver-Proxy (gegen Mock-Dienst getestet) |
+| XFCE | über xfce4-power-manager, ohne ihn xfce4-screensaver (gegen Mock-Dienst getestet); dort hält auch `-i` den Bildschirm an |
+| i3, dwm, bspwm, Openbox … (X11 ohne Desktop-Dienst) | `-d` und `-u` über den X-Server (gegen Xvfb getestet), `-i` über logind |
 | Hyprland (hypridle) | über ScreenSaver-D-Bus bzw. logind |
-| sway (swayidle) | wirkungslos, swayidle kennt keine Inhibitoren ohne Fenster |
-| TTY / SSH | logind `idle` bzw. `sleep` |
+| sway, river, niri … (swayidle ab 1.7) | über logind `idle`, sofern swayidle mit logind verbunden ist (eines von `before-sleep`, `after-resume`, `lock`, `unlock`, `idlehint` konfiguriert) |
+| TTY / SSH | logind `idle` bzw. `sleep`; das wirkt auf logind selbst und auf Dienste, die dessen Sperren beachten |
 | systemd oder elogind | beide (Artix, Devuan, Void, Alpine, Gentoo/OpenRC) |
 | ohne logind | ConsoleKit2, gleiche Schnittstelle (gegen Mock-Dienst getestet) |
 | glibc oder musl | beide |
-| Architektur | beliebig, auch big-endian; x86_64 und aarch64 laufen in der CI |
+| Architektur | beliebig; x86_64 und aarch64 laufen mit allen Tests in der CI, big-endian (s390x, mips, ppc64) wurde unter qemu geprüft |
 | Container, User-Namespace | Anmeldung am Bus auch mit abweichender uid |
-| Kernel | ab 2.6.27; unter 5.3 ohne pidfd, dann mit PDEATHSIG und Polling |
+| Kernel | genutzt wird nichts, was neuer ist als 2.6.27; unter 5.3 fehlt pidfd, dann PDEATHSIG und Polling (auf so alten Kerneln nicht getestet) |
 
 `-u` weckt den Bildschirm nur dort, wo `SimulateUserActivity` existiert (KDE, XFCE). Auf GNOME wirkt es
 nur als Display-Sperre.
 
 `-s` braucht die Erlaubnis von logind (polkit-Aktion `org.freedesktop.login1.inhibit-block-sleep`). In
 der Standardeinstellung haben sie root und Nutzer mit lokaler Sitzung. Wer nur über SSH angemeldet ist,
-müsste ein Admin-Passwort eingeben, `-s` schlägt dann fehl. `-i`, `-d` und `-u` sind davon nicht
-betroffen.
+müsste ein Admin-Passwort eingeben, `-s` schlägt dann fehl. Die `idle`-Sperre von `-i`, `-d` und `-u`
+darf jeder anlegen, solange polkit überhaupt läuft.
+
+Die `idle`-Sperre bei logind beachten nicht alle: Steht ein Rechner am GNOME-Anmeldebildschirm, legt
+ihn dessen Energieverwaltung trotzdem schlafen. Wer dort über SSH arbeitet, braucht `-s` als root.
 
 ## Tests
 
-`make test` startet zwei Skripte:
+`make test` startet drei Skripte:
 
-- `tests/smoke.sh` prüft Optionen, Meldungen und Exit-Codes. Es braucht keinen D-Bus.
+- `tests/smoke.sh` prüft Optionen, Meldungen und Exit-Codes. Es braucht keinen D-Bus und legt auch
+  auf einem Desktop keine echten Sperren an.
 - `tests/dbus.sh` startet einen privaten dbus-daemon mit Mock-Diensten und prüft, welche Sperre wo
   angelegt und wieder freigegeben wird: KDE, XFCE, GNOME, MATE, logind, ConsoleKit2, Neustart eines Dienstes,
   Ende des Session-Busses, Netzteil-Erkennung. Es braucht `dbus-daemon` und python3 mit PyGObject, für
   die Netzteil-Tests außerdem `unshare`. Was fehlt, wird übersprungen. Der echte Session- und System-Bus
   bleiben unberührt.
+- `tests/x11.sh` startet Xvfb mit Cookie-Anmeldung und prüft, dass `-d` den Bildschirmschoner des
+  X-Servers aussetzt und `-u` ihn beendet. Es braucht `Xvfb` und python3.
 
 Die CI (`.github/workflows/build.yml`) baut und testet auf Arch, Debian stable/oldstable, Ubuntu
 22.04, Fedora (clang), Rocky Linux 8, openSUSE Tumbleweed und Alpine (musl). Zusätzlich baut sie das
-statische Binary für x86_64 und aarch64 und startet es auf weiteren Distributionen. Bei einem Tag `v*`
-hängt sie die Binaries an das Release.
+statische Binary für x86_64 und aarch64, lässt alle Tests damit laufen und startet es auf weiteren
+Distributionen. Bei einem Tag `v*` hängt sie die Binaries an das Release.
+
+Von Hand geprüft wurden außerdem NixOS 26.05 (Flake-Build, echtes logind) und Void Linux mit glibc
+und musl (alle Tests, echtes elogind mit und ohne polkit), jeweils im Container.
 
 Zur Fehlersuche: `CAFFEINATE_DEBUG=1 caffeinate …`
 
