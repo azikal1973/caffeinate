@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-# Hilfsprogramm fuer tests/x11.sh. Spricht X11 direkt auf dem Socket, braucht
-# also keine Xlib.
+# Helper for tests/x11.sh. Speaks X11 directly on the socket, so it needs no
+# Xlib.
 #
-#   x11check.py XAUTHDATEI mkauth              Cookie erzeugen, Datei schreiben
-#   x11check.py XAUTHDATEI NUMMER timeout SEK  Timeout des Bildschirmschoners setzen
-#   x11check.py XAUTHDATEI NUMMER activate     Bildschirmschoner sofort einschalten
-#   x11check.py XAUTHDATEI NUMMER reset        ... und wieder aus (wie eine Eingabe)
-#   x11check.py XAUTHDATEI NUMMER state        gibt on, off oder disabled aus
+#   x11check.py XAUTHFILE mkauth               create a cookie, write the file
+#   x11check.py XAUTHFILE NUMBER timeout SECS  set the timeout of the screen saver
+#   x11check.py XAUTHFILE NUMBER activate      turn the screen saver on right away
+#   x11check.py XAUTHFILE NUMBER reset         ... and off again (like user input)
+#   x11check.py XAUTHFILE NUMBER state         prints on, off or disabled
 import os
 import socket
 import struct
@@ -21,7 +21,7 @@ def pad(data):
 
 def read_cookie(path):
     data = open(path, "rb").read()
-    fields, pos = [], 2  # Familie ueberspringen
+    fields, pos = [], 2  # skip the family
     for _ in range(4):
         (length,) = struct.unpack_from(">H", data, pos)
         fields.append(data[pos + 2:pos + 2 + length])
@@ -78,7 +78,7 @@ def main():
     path = sys.argv[1]
     if sys.argv[2] == "mkauth":
         cookie = os.urandom(16)
-        # Familie 65535 (jeder Rechner), ohne Adresse und Displaynummer
+        # family 65535 (any host), without address and display number
         with open(path, "wb") as f:
             f.write(struct.pack(">HHHH", 65535, 0, 0, len(COOKIE)) + COOKIE
                     + struct.pack(">H", len(cookie)) + cookie)
@@ -86,7 +86,7 @@ def main():
     display = Display(sys.argv[2], read_cookie(path))
     command = sys.argv[3]
     if command == "timeout":
-        # SetScreenSaver: Timeout, Intervall, prefer-blanking = Default, allow-exposures = Default
+        # SetScreenSaver: timeout, interval, prefer-blanking = default, allow-exposures = default
         display.sock.sendall(struct.pack("<BxHhhBBxx", 107, 3, int(sys.argv[4]), 0, 2, 2))
         display.sync()
     elif command in ("activate", "reset"):

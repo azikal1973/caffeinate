@@ -1,15 +1,15 @@
 #!/bin/sh
-# Smoke-Test ohne D-Bus (laeuft auch in CI-Containern):
-# Optionen, Meldungen und Exit-Codes wie bei Apples caffeinate.
+# Smoke test without D-Bus (also runs in CI containers):
+# options, messages and exit codes as with Apple's caffeinate.
 C=${1:-./caffeinate}
-# auch auf einem Desktop keine echten Sperren anlegen
+# take no real locks, not even on a desktop
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent
 export XDG_RUNTIME_DIR=/nonexistent
 unset DISPLAY WAYLAND_DISPLAY
 USAGE='usage: caffeinate [-disu] [-t timeout] [-w Process ID] [command arguments...]'
 fail=0
 
-check() {	# Beschreibung, erwartet, tatsaechlich
+check() {	# description, expected, actual
 	if [ "$2" = "$3" ]; then
 		echo "ok   $1"
 	else
@@ -38,7 +38,7 @@ check "-t ohne Wert: Meldung" "caffeinate: option requires an argument -- t" "$(
 "$C" /nonexistent/cmd 2>/dev/null; check "command fehlt: Exit 127" 127 "$?"
 "$C" sh -c 'kill -TERM $$' 2>/dev/null; check "command stirbt an SIGTERM: 143" 143 "$?"
 
-# wie Apple: der Elternprozess wird per exec zum command, $! ist dessen PID
+# like Apple: the parent exec()s the command, so $! is the PID of the command
 pids=$(C="$C" sh -c '"$C" sh -c "echo \$\$" 2>/dev/null & echo $!; wait' | sort -u | wc -l)
 check "command behaelt die PID von caffeinate" 1 "$pids"
 

@@ -1,3 +1,12 @@
+# caffeinate - build, test, install. Needs a C compiler and GNU make, nothing else.
+#
+#   make             build ./caffeinate (hardened, dynamically linked)
+#   make static      static binary that runs on every distribution
+#   make test        smoke, D-Bus and X11 tests (see tests/)
+#   make asan        build with AddressSanitizer and UBSan
+#   make install     install binary and man page under PREFIX (default ~/.local)
+#   make uninstall   remove them again
+
 VERSION = 0.2.0.0
 
 PREFIX  ?= $(HOME)/.local
@@ -6,30 +15,30 @@ MANDIR  ?= $(PREFIX)/share/man/man8
 
 CC      ?= cc
 
-# Haertung als Vorgabe. Wer CFLAGS und LDFLAGS selbst setzt (Distro-Pakete),
-# bringt seine eigene mit. _FORTIFY_SOURCE setzt caffeinate.c.
-# -fstack-protector-strong kennt gcc erst ab 4.9, deshalb die Probe.
+# Hardening by default. Whoever sets CFLAGS and LDFLAGS (distro packages)
+# brings their own. _FORTIFY_SOURCE is set inside caffeinate.c.
+# gcc only knows -fstack-protector-strong since 4.9, hence the probe.
 HARDEN   = $(shell $(CC) -fstack-protector-strong -E -x c /dev/null >/dev/null 2>&1 && echo -fstack-protector-strong)
 CFLAGS  ?= -O2 -g $(HARDEN)
 LDFLAGS ?= -pie -Wl,-z,relro,-z,now
 
-# override: auch bei CFLAGS=... von der Kommandozeile (Distro-Pakete, asan).
-# -fPIE gehoert zu -pie, auch wenn nur CFLAGS ersetzt wurden.
+# override: added even to CFLAGS=... from the command line (distro packages, asan).
+# -fPIE belongs with -pie, even when only CFLAGS were replaced.
 override CFLAGS += -std=c11 -Wall -Wextra -Wpedantic $(if $(filter -pie -static-pie,$(LDFLAGS)),-fPIE)
 
 all: caffeinate
 
-# explizit: bei make -B wuerde sonst die eingebaute .c->.o->Binary-Kette greifen
+# explicit rule: with make -B the built-in .c -> .o -> binary chain would apply otherwise
 caffeinate: caffeinate.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
-# -B: immer neu bauen, auch wenn schon ein normales Binary daliegt
+# -B: always rebuild, even if a regular binary is already there
 asan:
 	$(MAKE) -B caffeinate CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 		-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0" LDFLAGS="-fsanitize=address,undefined"
 
-# ein Binary fuer jede Distribution; braucht die statische libc (musl oder glibc-static).
-# Als static-pie, wo die Toolchain das kann, sonst klassisch statisch.
+# One binary for every distribution; needs the static libc (musl or glibc-static).
+# Built as static-pie where the toolchain can do that, plain static otherwise.
 static:
 	$(MAKE) -B caffeinate CFLAGS="-O2 $(HARDEN)" LDFLAGS="-static-pie -s -Wl,-z,relro,-z,now" || \
 	$(MAKE) -B caffeinate CFLAGS="-O2" LDFLAGS="-static -s"

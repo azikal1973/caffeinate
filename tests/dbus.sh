@@ -1,11 +1,11 @@
 #!/bin/sh
-# D-Bus-Test: ein privater dbus-daemon spielt Session- und System-Bus, dazu
-# kommen Mock-Dienste (tests/mockbus.py). Geprueft wird, welche Sperre
-# caffeinate bei welchem Dienst anlegt und wann sie wieder weg ist.
-# Der echte Session- und System-Bus bleiben unberuehrt.
+# D-Bus test: a private dbus-daemon plays session and system bus, joined by
+# mock services (tests/mockbus.py). Checks which lock caffeinate takes from
+# which service, and when that lock is gone again.
+# The real session bus and system bus are not touched.
 #
-# Braucht dbus-daemon und python3 mit PyGObject, fuer die Netzteil-Tests
-# zusaetzlich unshare (Mount-Namespace); was fehlt, wird uebersprungen.
+# Needs dbus-daemon and python3 with PyGObject, and for the power supply
+# tests also unshare (mount namespace); whatever is missing gets skipped.
 C=${1:-./caffeinate}
 case $C in /*) ;; *) C=$PWD/$C ;; esac
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -16,7 +16,7 @@ if ! command -v dbus-daemon >/dev/null 2>&1 ||
 	exit 0
 fi
 
-# kurz halten: Pfade von Unix-Sockets duerfen nur gut 100 Zeichen lang sein
+# keep it short: paths of unix sockets may only be about 100 characters long
 T=$(mktemp -d /tmp/caffeinate-test.XXXXXX) || exit 1
 LOG=$T/log
 fail=0
@@ -30,7 +30,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' INT TERM
 
-check() {	# Beschreibung, erwartet, tatsaechlich
+check() {	# description, expected, actual
 	if [ "$2" = "$3" ]; then
 		echo "ok   $1"
 	else
@@ -39,11 +39,11 @@ check() {	# Beschreibung, erwartet, tatsaechlich
 	fi
 }
 
-lines() {	# Muster -> Anzahl passender Protokollzeilen
+lines() {	# pattern -> number of matching log lines
 	grep -c -- "$1" "$LOG" || true
 }
 
-waitlog() {	# Muster, Mindestanzahl (Standard 1), Wartezeit in Zehntelsekunden (Standard 50)
+waitlog() {	# pattern, minimum count (default 1), wait in tenths of a second (default 50)
 	i=0
 	while [ "$(lines "$1")" -lt "${2:-1}" ]; do
 		i=$((i + 1))
@@ -52,7 +52,7 @@ waitlog() {	# Muster, Mindestanzahl (Standard 1), Wartezeit in Zehntelsekunden (
 	done
 }
 
-has() {	# Beschreibung, Muster, Mindestanzahl
+has() {	# description, pattern, minimum count
 	if waitlog "$2" "${3:-1}"; then
 		echo "ok   $1"
 	else
@@ -62,11 +62,11 @@ has() {	# Beschreibung, Muster, Mindestanzahl
 	fi
 }
 
-hasnt() {	# Beschreibung, Muster
+hasnt() {	# description, pattern
 	check "$1" 0 "$(lines "$2")"
 }
 
-start_bus() {	# Name -> Socket $T/Name, PID in $bus_pid
+start_bus() {	# name -> socket $T/name, PID in $bus_pid
 	dbus-daemon --config-file="$T/bus.conf" --address="unix:path=$T/$1" --nofork --nopidfile 2>/dev/null &
 	bus_pid=$!
 	pids="$pids $bus_pid"
@@ -78,7 +78,7 @@ start_bus() {	# Name -> Socket $T/Name, PID in $bus_pid
 	done
 }
 
-mock() {	# Bus, Dienste... -> PID in $mock_pid
+mock() {	# bus, services... -> PID in $mock_pid
 	bus=$1
 	shift
 	DBUS_SESSION_BUS_ADDRESS="unix:path=$T/$bus" python3 "$HERE/mockbus.py" "$LOG" "$@" &
@@ -112,7 +112,7 @@ start_bus session
 start_bus system
 export DBUS_SESSION_BUS_ADDRESS="unix:path=$T/session"
 export DBUS_SYSTEM_BUS_ADDRESS="unix:path=$T/system"
-export XDG_RUNTIME_DIR="$T"	# kein $T/bus: der echte Session-Bus ist nicht erreichbar
+export XDG_RUNTIME_DIR="$T"	# no $T/bus there: the real session bus is out of reach
 unset CAFFEINATE_DEBUG
 
 # ---------------------------------------------------------------- KDE
@@ -162,7 +162,7 @@ wait "$spid" 2>/dev/null
 "$C" -w 2147483646
 check "-w mit unbekannter PID: sofort Exit 0" 0 "$?"
 
-# Latin-1-Dateiname: der Grund muss gueltiges UTF-8 bleiben, sonst trennt der Bus
+# Latin-1 file name: the reason has to stay valid UTF-8, or the bus disconnects
 : > "$LOG"
 latin=$T/$(printf 'x\377y')
 if printf '#!/bin/sh\nexit 0\n' > "$latin" 2>/dev/null && chmod +x "$latin"; then
@@ -171,7 +171,7 @@ if printf '#!/bin/sh\nexit 0\n' > "$latin" 2>/dev/null && chmod +x "$latin"; the
 fi
 stop "$m"
 
-# fremde Nachrichten vor der Antwort, eine davon uebergross
+# unrelated messages ahead of the reply, one of them oversized
 : > "$LOG"
 mock session pm noisy
 m=$mock_pid
@@ -189,8 +189,8 @@ has "-d: Dienst nur unter /ScreenSaver" "^ss-legacy /ScreenSaver Inhibit "
 stop "$m"
 
 # ---------------------------------------------------------------- XFCE
-# xfce4-power-manager haelt, solange es gesperrt ist, DPMS und Bildschirmschoner
-# selbst an; org.xfce.ScreenSaver direkt zaehlt nur, wenn der Power-Manager fehlt
+# while it is inhibited, xfce4-power-manager itself holds off DPMS and the screen
+# saver; org.xfce.ScreenSaver directly only counts when the power manager is absent
 : > "$LOG"
 mock session xfpm xfss
 m=$mock_pid
@@ -208,7 +208,7 @@ m=$mock_pid
 has "XFCE ohne Power-Manager -d: xfce4-screensaver" "^xfss /org/xfce/ScreenSaver Inhibit cookie=[0-9]* app=caffeinate "
 stop "$m"
 
-# xfce4-power-manager startet erst nach caffeinate: Die Sperre wechselt dorthin
+# xfce4-power-manager starts after caffeinate: the lock moves over to it
 : > "$LOG"
 mock session xfss
 m=$mock_pid
@@ -227,7 +227,7 @@ stop "$m"
 stop "$m2"
 
 # ---------------------------------------------------------------- GNOME, Cinnamon, MATE
-# alle drei melden ihren Session-Manager als org.gnome.SessionManager
+# all three register their session manager as org.gnome.SessionManager
 : > "$LOG"
 mock session gsm
 m=$mock_pid
@@ -258,7 +258,7 @@ DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent "$C" -d -t 1
 has "ohne Session-Bus: logind idle" "^login1 Inhibit what=idle "
 has "ohne Session-Bus: fd am Ende geschlossen" "^login1 released idle\$"
 
-# ---------------------------------------------------------------- ignorierte Signale (nohup)
+# ---------------------------------------------------------------- ignored signals (nohup)
 : > "$LOG"
 mock session pm
 m=$mock_pid
@@ -272,7 +272,7 @@ hasnt "nohup: SIGHUP gibt die Sperre nicht frei" " UnInhibit "
 wait "$cpid"
 check "nohup: laeuft bis zum Timeout, Exit 0" 0 "$?"
 
-# mit command: der Hilfsprozess muss das SIGHUP ebenso ueberstehen wie das command
+# with a command: the helper process has to survive the SIGHUP just like the command
 : > "$LOG"
 (trap '' HUP; exec "$C" -i sleep 3) &
 cpid=$!
@@ -290,9 +290,9 @@ wait "$cpid"
 has "nohup mit command: Freigabe erst mit dem Ende des command" " UnInhibit "
 stop "$m"
 
-# ---------------------------------------------------------------- Dienst startet neu
+# ---------------------------------------------------------------- a service restarts
 : > "$LOG"
-# nicht als "VAR=x mock ...": vor Funktionsaufrufen bleibt das je nach Shell gesetzt
+# not as "VAR=x mock ...": in front of a function call that stays set in some shells
 MOCK_COOKIE=7
 export MOCK_COOKIE
 mock session pm
@@ -315,7 +315,7 @@ has "SIGTERM: Sperre vorher freigegeben" "^pm .* UnInhibit 1\$"
 hasnt "Neustart: altes Cookie wird nicht mehr benutzt" " UnInhibit 7\$"
 stop "$m"
 
-# der Dienst endet unmittelbar vor caffeinate (Abmelden): kein Absturz, auch nicht mit Debug-Ausgabe
+# the service exits right before caffeinate (logout): no crash, not even with debug output
 : > "$LOG"
 mock session pm
 m=$mock_pid
@@ -329,7 +329,7 @@ wait "$cpid"
 check "Dienst endet kurz vor caffeinate: Exit durch SIGTERM" 143 "$?"
 wait "$m" 2>/dev/null
 
-# der Session-Bus selbst endet (Abmeldung)
+# the session bus itself exits (logout)
 : > "$LOG"
 start_bus session2
 sb=$bus_pid
@@ -345,7 +345,7 @@ wait "$cpid"
 check "Abmeldung: laeuft weiter bis zum Signal" 143 "$?"
 has "Abmeldung: Ersatzsperre am Ende freigegeben" "^login1 released idle\$"
 
-# ---------------------------------------------------------------- -s und das Netzteil
+# ---------------------------------------------------------------- -s and the power supply
 if unshare -rm true 2>/dev/null; then
 	UNSHARE="unshare -rm"
 elif unshare -m true 2>/dev/null; then
@@ -357,7 +357,7 @@ P=$T/power
 mkdir "$P"
 # shellcheck disable=SC2016
 if [ -n "$UNSHARE" ] && $UNSHARE sh -c 'mount --bind "$1" /sys/class/power_supply' sh "$P" 2>/dev/null; then
-	dev() {	# Name, Attribut=Wert... (Attribut auch mit Unterverzeichnis)
+	dev() {	# name, attribute=value... (the attribute may include a subdirectory)
 		d=$P/$1
 		shift
 		for kv; do
@@ -365,7 +365,7 @@ if [ -n "$UNSHARE" ] && $UNSHARE sh -c 'mount --bind "$1" /sys/class/power_suppl
 			printf '%s\n' "${kv#*=}" > "$d/${kv%%=*}"
 		done
 	}
-	power() {	# Beschreibung, erwartete Zahl an sleep-Sperren; Geraete liegen in $P
+	power() {	# description, expected number of sleep locks; the devices are in $P
 		: > "$LOG"
 		# shellcheck disable=SC2016
 		$UNSHARE sh -c 'mount --bind "$1" /sys/class/power_supply && shift && exec "$@"' sh "$P" "$C" -s -t 1
@@ -400,7 +400,7 @@ if [ -n "$UNSHARE" ] && $UNSHARE sh -c 'mount --bind "$1" /sys/class/power_suppl
 	dev BAT0 type=Battery status=Charging
 	power "USB-C-Port wird gespeist: Sperre" 1
 
-	# Netzteil wird im Betrieb gezogen
+	# the power supply is unplugged while caffeinate runs
 	: > "$LOG"
 	dev AC type=Mains online=1
 	dev BAT0 type=Battery status=Charging
@@ -424,8 +424,8 @@ else
 fi
 stop "$ml"
 
-# fremde Signale mit fds direkt vor der Antwort von logind: caffeinate muss
-# den fd der Sperre halten, nicht einen der fremden
+# unrelated signals carrying fds right before the reply from logind: caffeinate
+# has to hold the fd of the lock, not one of the others
 : > "$LOG"
 mock system login1 noisy
 m=$mock_pid
@@ -439,8 +439,8 @@ wait "$cpid"
 has "fremde fds vor der Antwort: am Ende freigegeben" "^login1 released idle\$"
 stop "$m"
 
-# Dienst weg und nichts als Ersatz: gemeldet wird erst, wenn auch das
-# Nachfassen nach 5 s nichts gebracht hat, und wieder, wenn die Sperre zurueck ist
+# service gone and nothing to replace it: that is reported only once the
+# follow-up after 5 s has failed too, and again when the lock is back
 : > "$LOG"
 mock session pm
 m=$mock_pid
@@ -466,7 +466,7 @@ kill -TERM "$cpid"
 wait "$cpid" 2>/dev/null
 stop "$m"
 
-# ---------------------------------------------------------------- ConsoleKit2, gar nichts
+# ---------------------------------------------------------------- ConsoleKit2, nothing at all
 : > "$LOG"
 mock system ck
 m=$mock_pid
@@ -480,7 +480,7 @@ check "keine Sperre moeglich: Exit 1" 1 "$?"
 check "keine Sperre moeglich: Grund" "caffeinate: weder logind noch elogind oder ConsoleKit2 am System-Bus" "$(echo "$out" | head -n 1)"
 check "keine Sperre moeglich: Meldung" "Failed to create PreventUserIdleSystemSleep assertion" "$(echo "$out" | tail -n 1)"
 
-# logind ohne polkit lehnt jeden ausser root ab: das soll in der Meldung stehen, nicht das fehlende ConsoleKit
+# logind without polkit refuses everyone but root: the message has to say that, not that ConsoleKit is missing
 mock system login1-denied
 m=$mock_pid
 out=$("$C" -i -t 1 2>&1)

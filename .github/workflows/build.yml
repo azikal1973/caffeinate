@@ -5,17 +5,17 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Nur lesen; schreiben darf allein der Release-Job.
+# Read-only; the release job alone may write.
 permissions:
   contents: read
 
 jobs:
-  # Bauen und testen mit dem Compiler und der libc der jeweiligen Distribution.
-  # dbus-daemon und PyGObject sind fuer tests/dbus.sh, Xvfb fuer tests/x11.sh.
-  # --privileged erlaubt die Netzteil-Tests (Mount-Namespace). Das gibt fremdem
-  # Code aus einem Pull-Request nichts, was er nicht schon haette: Er kann auch
-  # diesen Workflow aendern, laeuft auf einem Wegwerf-Runner und bekommt nur
-  # das lesende Token.
+  # Build and test with each distribution's own compiler and libc.
+  # dbus-daemon and PyGObject are for tests/dbus.sh, Xvfb is for tests/x11.sh.
+  # --privileged allows the power supply tests (mount namespace). It gives
+  # foreign code from a pull request nothing it does not have anyway: such code
+  # can change this workflow as well, runs on a throwaway runner and only gets
+  # the read-only token.
   build:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
@@ -55,8 +55,8 @@ jobs:
           docker run --rm --privileged -v "$PWD:/src" -w /src ${{ matrix.image }} sh -c \
             '${{ matrix.setup }} && make CC=${{ matrix.cc || 'cc' }} && make test'
 
-  # Statisches Binary (musl), das ohne Installation auf jeder Distribution laeuft.
-  # Alle Tests laufen hier mit genau diesem Binary, auf aarch64 nur hier.
+  # Static binary (musl) that runs on every distribution without installation.
+  # All tests run here with exactly this binary; on aarch64 they run only here.
   static:
     name: Statisches Binary (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -86,7 +86,7 @@ jobs:
           path: caffeinate-${{ matrix.arch }}-linux
           if-no-files-found: error
 
-  # Bei einem Tag v* die Binaries an ein Release haengen.
+  # On a tag v*, attach the binaries to a release.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build, static]

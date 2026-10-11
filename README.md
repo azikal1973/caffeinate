@@ -199,6 +199,23 @@ und Void Linux mit glibc und musl (alle Tests, echtes elogind mit polkit), jewei
 
 Zur Fehlersuche: `CAFFEINATE_DEBUG=1 caffeinate …`
 
+## Aufbau des Codes
+
+Der Quelltext ist auf Englisch kommentiert. Am Anfang von `caffeinate.c` steht, was das Programm tut
+und nach welchen Mustern es gebaut ist:
+
+- Eine Sperre hängt immer an einer offenen Verbindung (Session-Bus, logind-fd, X-Server) und fällt
+  mit ihr weg. Es kann deshalb keine Sperre zurückbleiben, auch nicht nach `kill -9`.
+- Die Desktop-Dienste stehen als Tabellen mit Rangfolge im Code. Der erste laufende Dienst bekommt
+  die Sperre, logind ist der Ersatz dahinter.
+- Ein Thread, eine `poll()`-Schleife: Signale, Prozessende, Bus und X-Server kommen als
+  Dateideskriptoren an, alle Fristen sind absolute Zeitpunkte.
+- Ereignisse markieren eine Sperre nur als veraltet. Ein eigener Schritt gleicht danach ab, was
+  gewünscht ist und was tatsächlich gehalten wird.
+
+Darauf folgen die Abschnitte Assertions, Helpers, D-Bus, X11, Power supply, Acquire and release und
+main, jeweils mit eigener Einleitung. Die Meldungen des Programms bleiben deutsch.
+
 ## Lizenz
 
 MIT, siehe [LICENSE](LICENSE). Der Code ist eine eigene Implementierung. Apples caffeinate.c

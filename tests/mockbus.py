@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-# Mock der D-Bus-Dienste, die caffeinate anspricht (fuer tests/dbus.sh).
+# Mocks of the D-Bus services that caffeinate talks to (for tests/dbus.sh).
 #
-#   mockbus.py PROTOKOLL DIENST...
+#   mockbus.py LOGFILE SERVICE...
 #
-# Verbindet sich mit dem Bus aus DBUS_SESSION_BUS_ADDRESS und schreibt jeden
-# Aufruf als Zeile ins Protokoll. Dienste:
-#   pm         org.freedesktop.PowerManagement (PowerDevil von KDE)
-#   xfpm       dasselbe, zusaetzlich unter org.xfce.PowerManager (xfce4-power-manager)
-#   ss         org.freedesktop.ScreenSaver unter beiden Pfaden
-#   ss-legacy  org.freedesktop.ScreenSaver nur unter /ScreenSaver
-#   ss-broken  wie ss, aber Inhibit antwortet mit einem Fehler
+# Connects to the bus named by DBUS_SESSION_BUS_ADDRESS and writes every call
+# as one line to the log file. Services:
+#   pm         org.freedesktop.PowerManagement (PowerDevil of KDE)
+#   xfpm       the same, also under org.xfce.PowerManager (xfce4-power-manager)
+#   ss         org.freedesktop.ScreenSaver at both paths
+#   ss-legacy  org.freedesktop.ScreenSaver at /ScreenSaver only
+#   ss-broken  like ss, but Inhibit answers with an error
 #   xfss       org.xfce.ScreenSaver
 #   gsm        org.gnome.SessionManager (GNOME, Cinnamon, MATE)
-#   login1     org.freedesktop.login1 (Inhibit liefert einen fd)
-#   login1-denied  wie login1, aber Inhibit wird abgelehnt (logind ohne polkit)
-#   ck         org.freedesktop.ConsoleKit (ebenso)
-#   noisy      kein Dienst: vor jeder Antwort fremde Signale an den Aufrufer, ein kleines
-#              und ein uebergrosses, beide mit fds im Gepaeck
-# MOCK_COOKIE legt das erste vergebene Cookie fest (Standard 1).
+#   login1     org.freedesktop.login1 (Inhibit returns an fd)
+#   login1-denied  like login1, but Inhibit is refused (logind without polkit)
+#   ck         org.freedesktop.ConsoleKit (likewise)
+#   noisy      not a service: ahead of every reply, unrelated signals to the caller, a
+#              small one and an oversized one, both carrying fds
+# MOCK_COOKIE sets the first cookie that is handed out (default 1).
 import itertools
 import os
 import sys
@@ -28,7 +28,7 @@ import gi
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib  # noqa: E402
 
-# neuere PyGObject-Versionen raten von register_object ab, aeltere kennen nichts anderes
+# newer PyGObject versions deprecate register_object, older ones know nothing else
 warnings.simplefilter("ignore", DeprecationWarning)
 
 FDO_XML = """<node><interface name='%s'>
@@ -65,7 +65,7 @@ FDO_SS = "org.freedesktop.ScreenSaver"
 FDO_PM = "org.freedesktop.PowerManagement"
 XFCE_SS = "org.xfce.ScreenSaver"
 
-# Dienst -> (Busnamen, Schnittstelle, XML, Pfade)
+# service -> (bus names, interface, XML, paths)
 SERVICES = {
     "pm": (FDO_PM, FDO_PM + ".Inhibit", PM_XML, ["/org/freedesktop/PowerManagement/Inhibit"]),
     "xfpm": ("org.xfce.PowerManager " + FDO_PM, FDO_PM + ".Inhibit", PM_XML,
@@ -124,7 +124,7 @@ def make_handler(tag):
             out(tag, "Inhibit-abgelehnt", args[0])
             invocation.return_dbus_error("org.freedesktop.DBus.Error.AccessDenied", "Permission denied")
         elif tag in ("login1", "ck"):
-            # wie logind: der Aufrufer bekommt das Schreibende, wir sehen sein Ende
+            # like logind: the caller gets the write end, and we see when it goes away
             what, who, why, mode = args
             r, w = os.pipe()
             fds = Gio.UnixFDList.new()
@@ -162,7 +162,7 @@ for tag in wanted:
         conn.register_object(path, info, make_handler(tag), None, None)
     names = names.split()
     for name in names:
-        # "ready" erst, wenn der letzte Name vergeben ist
+        # "ready" only once the last name has been acquired
         Gio.bus_own_name_on_connection(
             conn, name, Gio.BusNameOwnerFlags.NONE,
             (lambda _c, _n, tag=tag: out("ready", tag)) if name == names[-1] else None, None)

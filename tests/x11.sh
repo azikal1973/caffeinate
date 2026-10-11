@@ -1,10 +1,10 @@
 #!/bin/sh
-# X11-Test: Xvfb mit Cookie-Anmeldung, kein D-Bus. Prueft, dass -d den
-# Bildschirmschoner des X-Servers aussetzt, solange caffeinate laeuft, und
-# dass -u ihn beendet. tests/x11check.py stellt dazu den Timeout ein und
-# fragt den Zustand ab.
+# X11 test: Xvfb with cookie authentication, no D-Bus. Checks that -d
+# suspends the screen saver of the X server for as long as caffeinate runs,
+# and that -u ends a running one. tests/x11check.py sets the timeout for
+# this and queries the state.
 #
-# Braucht Xvfb und python3; fehlt etwas davon, wird der Test uebersprungen.
+# Needs Xvfb and python3; if either is missing, the test is skipped.
 C=${1:-./caffeinate}
 case $C in /*) ;; *) C=$PWD/$C ;; esac
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -26,7 +26,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' INT TERM
 
-check() {	# Beschreibung, erwartet, tatsaechlich
+check() {	# description, expected, actual
 	if [ "$2" = "$3" ]; then
 		echo "ok   $1"
 	else
@@ -36,7 +36,7 @@ check() {	# Beschreibung, erwartet, tatsaechlich
 }
 
 python3 "$HERE/x11check.py" "$T/xauth" mkauth
-# -noreset: sonst setzt sich der Server zurueck, sobald der letzte Client geht, und vergisst den Timeout
+# -noreset: otherwise the server resets once the last client leaves, and forgets the timeout
 Xvfb -displayfd 3 -auth "$T/xauth" -noreset -nolisten tcp -screen 0 640x480x8 3> "$T/display" 2>/dev/null &
 xvfb=$!
 pids=$xvfb
@@ -48,7 +48,7 @@ while [ ! -s "$T/display" ]; do
 done
 num=$(cat "$T/display")
 
-x() {	# Befehl [Wert]
+x() {	# command [value]
 	python3 "$HERE/x11check.py" "$T/xauth" "$num" "$@"
 }
 
@@ -56,7 +56,7 @@ export DISPLAY=":$num" XAUTHORITY="$T/xauth" XDG_RUNTIME_DIR="$T"
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent
 unset WAYLAND_DISPLAY CAFFEINATE_DEBUG
 
-# Gegenprobe: ohne caffeinate springt der Bildschirmschoner nach 1 s an
+# cross-check: without caffeinate the screen saver kicks in after 1 s
 x timeout 1
 sleep 2.5
 check "ohne caffeinate: Bildschirmschoner nach Timeout an" on "$(x state)"
@@ -99,7 +99,7 @@ check "unter Wayland wird der X-Server nicht benutzt: Exit 1" 1 "$?"
 "$C" -i -t 1 2>/dev/null
 check "-i benutzt den X-Server nicht: Exit 1" 1 "$?"
 
-# der X-Server endet: caffeinate meldet die verlorene Sperre und laeuft weiter
+# the X server exits: caffeinate reports the lost lock and keeps running
 "$C" -d 2> "$T/err" &
 cpid=$!
 pids="$pids $cpid"

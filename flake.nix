@@ -13,7 +13,7 @@
     {
       packages = forAllSystems (pkgs: {
         default = pkgs.callPackage ./package.nix { };
-        # statisch gelinkt (musl): laeuft auch ausserhalb von NixOS
+        # statically linked (musl): also runs outside NixOS
         static = pkgs.pkgsStatic.callPackage ./package.nix { };
       });
 
@@ -21,7 +21,7 @@
         caffeinate = final.callPackage ./package.nix { };
       };
 
-      # make test samt D-Bus-Test: nix develop -c make test
+      # everything make test needs, D-Bus and X11 tests included: nix develop -c make test
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
@@ -29,10 +29,10 @@
             pkgs.dbus
             pkgs.util-linux
             (pkgs.python3.withPackages (p: [ p.pygobject3 ]))
-            # Xvfb fuer tests/x11.sh
+            # Xvfb for tests/x11.sh
             (pkgs.xorg-server or pkgs.xorg.xorgserver)
           ];
-          # PyGObject findet die Typelibs von GLib/Gio hierueber
+          # this is how PyGObject finds the typelibs of GLib/Gio
           GI_TYPELIB_PATH = lib.makeSearchPath "lib/girepository-1.0" [
             pkgs.glib.out
             pkgs.gobject-introspection

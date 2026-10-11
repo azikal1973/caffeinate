@@ -1,45 +1,114 @@
 /*
- * caffeinate - Nachbau von macOS caffeinate(8) fuer Linux
+ * caffeinate - a Linux clone of macOS caffeinate(8)
  *
  *   caffeinate [-disu] [-t timeout] [-w Process ID] [command arguments...]
  *
- * Verhalten wie Apples caffeinate.c (PowerManagement), nicht nur wie die
- * Manpage - wo sich beide widersprechen, zaehlt der Code:
- *   - ohne Assertion-Flag gilt -i; -h gibt die Usage aus (Exit 0)
- *   - -t/-w werden mit strtol(..., 0) gelesen; -t 0 heisst "kein Timeout"
- *   - -t gilt pro Assertion; mit command laeuft caffeinate trotzdem bis
- *     zum Ende des command weiter
- *   - -u ohne -t: Assertion 5 s (die danach folgende -m ebenso), der
- *     Prozess selbst laeuft weiter
- *   - mit command wird der Elternprozess per exec zum command, ein Kind
- *     haelt die Assertions und ignoriert SIGINT/SIGQUIT
+ * WHAT IT DOES
  *
- * Abbildung der macOS-Assertions:
- *   -i  PreventUserIdleSystemSleep  -> org.freedesktop.PowerManagement.Inhibit
- *                                      (sonst SessionManager, Flag suspend)
- *   -d  PreventUserIdleDisplaySleep -> org.freedesktop.ScreenSaver.Inhibit
- *                                      (XFCE: xfce4-power-manager bzw.
- *                                      org.xfce.ScreenSaver; sonst
- *                                      SessionManager, Flag idle)
- *   -s  PreventSystemSleep (nur AC) -> logind-Inhibitor "sleep"
- *   -u  UserIsActive                -> ScreenSaver.SimulateUserActivity + wie -d
- *   -m  PreventDiskIdle             -> kein Gegenstueck, wird angenommen
- * Ohne Session-Bus oder ohne passenden Desktop-Dienst fallen -i/-d/-u auf
- * den logind-Inhibitor "idle" zurueck. logind heisst hier auch elogind;
- * ConsoleKit2 hat dieselbe Schnittstelle und wird danach versucht.
- * In einer X11-Sitzung setzen -d/-u zusaetzlich Bildschirmschoner und DPMS
- * des X-Servers aus - das wirkt auch ohne jeden Desktop-Dienst (i3, dwm ...).
+ * Keeps the machine awake for as long as it runs: forever, for -t seconds,
+ * until process -w exits, or until the given command finishes. macOS calls
+ * such a request a "power assertion", Linux an "inhibitor lock". This program
+ * takes Apple's five assertion types and maps each one to whatever the
+ * running system offers:
  *
- * Alle Sperren haengen an Verbindungen (Bus, X-Server) bzw. am logind-fd
- * und fallen weg, sobald der Prozess endet - auch bei kill -9. Startet ein
- * Desktop-Dienst neu und vergisst damit die Sperre, wird sie neu angelegt.
+ *   -i  PreventUserIdleSystemSleep   -> org.freedesktop.PowerManagement.Inhibit
+ *                                       (else SessionManager, flag "suspend")
+ *   -d  PreventUserIdleDisplaySleep  -> org.freedesktop.ScreenSaver.Inhibit
+ *                                       (XFCE: xfce4-power-manager or
+ *                                       org.xfce.ScreenSaver; else
+ *                                       SessionManager, flag "idle")
+ *   -s  PreventSystemSleep (AC only) -> logind inhibitor "sleep"
+ *   -u  UserIsActive                 -> ScreenSaver.SimulateUserActivity,
+ *                                       then the same as -d
+ *   -m  PreventDiskIdle              -> no counterpart; accepted, does nothing
  *
- * Gebraucht wird nur die libc: D-Bus und X11 werden direkt auf dem Socket
- * gesprochen.
- * Statisch gelinkt laeuft das Binary damit auf jeder Distribution.
+ * Without a session bus, or without a desktop service that answers, -i/-d/-u
+ * fall back to the logind inhibitor "idle". "logind" here always includes
+ * elogind; ConsoleKit2 has the same interface and is tried after it. In an
+ * X11 session -d/-u additionally suspend the X server's own screen saver and
+ * DPMS, which works without any desktop service at all (i3, dwm ...).
+ *
+ * DESIGN
+ *
+ * In one sentence: a single-threaded reactor (one poll() loop) that holds a
+ * set of connection-scoped leases and keeps reconciling them against a table
+ * of backends. The patterns in detail:
+ *
+ * 1. A lock is a lease tied to an open connection.
+ *    Nothing is ever switched off globally. Every lock taken here belongs to
+ *    a connection: the cookie from a desktop service to our session bus
+ *    connection, the logind lock to a file descriptor, the X11 suspend to
+ *    our X connection. The other side drops the lock when that connection
+ *    closes, and the kernel closes it when the process ends - even after
+ *    kill -9. A lock can therefore never be left behind, and correctness
+ *    does not depend on cleanup code. The price: a service that restarts
+ *    forgets its locks; see 4.
+ *
+ * 2. Backends are data, tried in order (chain of responsibility).
+ *    display_backends[] and system_backends[] list the known desktop
+ *    services by priority. sess_inhibit() walks a list and takes the first
+ *    service that is running; logind is the fallback behind every list.
+ *    Supporting another desktop means adding a table row, not code.
+ *
+ * 3. One thread, one poll() loop (reactor).
+ *    main() waits on a signalfd (termination signals), a pidfd (the watched
+ *    process), the session bus socket and the X sockets. All timers - -t,
+ *    per-assertion expiry, the AC check for -s, pending re-acquisition - are
+ *    absolute CLOCK_MONOTONIC deadlines from which the poll timeout is
+ *    derived. There are no threads, no signal handlers and no callbacks.
+ *    Remote calls are synchronous: call() blocks until the reply or a 5 s
+ *    deadline and hands every unrelated message to bus_other().
+ *
+ * 4. Desired state versus actual state (reconciliation).
+ *    struct assertion records what the user asked for (active, expires) and
+ *    what currently enforces it (be + cookie, fd, xfd). Events never repair
+ *    anything themselves: name_changed() merely marks an assertion stale and
+ *    sets refresh_at; refresh_assertions() later re-acquires it, moves it to
+ *    a better backend that has appeared, or reports it as lost and keeps
+ *    retrying.
+ *
+ * 5. With a command, parent and child swap roles.
+ *    As in Apple's tool, the parent exec()s the command - PID, exit status
+ *    and signals are then the command's own - while a forked child holds the
+ *    assertions and watches the parent (pidfd, or PDEATHSIG before Linux 5.3).
+ *
+ * 6. No dependencies beyond libc.
+ *    The D-Bus and X11 wire protocols are spoken directly on their unix
+ *    sockets, limited to the few messages needed. Linked statically, the
+ *    binary therefore runs on every distribution.
+ *
+ * COMPATIBILITY WITH APPLE
+ *
+ * Behaviour follows Apple's caffeinate.c (PowerManagement project), not just
+ * its man page; where the two disagree, the code wins:
+ *   - with no assertion flag, -i is assumed; -h prints the usage (exit 0)
+ *   - -t/-w are parsed with strtol(..., 0); -t 0 means "no timeout"
+ *   - -t applies per assertion; with a command, caffeinate still runs until
+ *     the command ends
+ *   - -u without -t: the assertion lasts 5 s (as does a -m after it), the
+ *     process itself keeps running
+ *   - with a command, the child that holds the assertions ignores
+ *     SIGINT/SIGQUIT
+ *
+ * READING GUIDE
+ *
+ *   Assertions           types, backend tables, per-assertion state
+ *   Helpers              time, option parsing, UTF-8, fd hygiene
+ *   D-Bus                wire format, connection, authentication, call()
+ *   X11                  Xauthority, connection setup, screen saver suspend
+ *   Power supply         on_ac_power() for -s
+ *   Acquire and release  the state machine described in 4.
+ *   main                 options, fork/exec, event loop
+ *
+ * Messages for the user are in German, except those Apple's tool prints
+ * (usage, getopt errors, "Failed to create ... assertion"), which are kept
+ * verbatim. CAFFEINATE_DEBUG=1 traces every step on stderr.
  */
 #define _GNU_SOURCE
-/* Haertung der libc-Aufrufe, wenn Compiler oder Distribution sie nicht schon vorgeben */
+/*
+ * Harden libc calls unless the compiler or the distribution already asks for
+ * it. Has to come before the first #include.
+ */
 #if !defined(_FORTIFY_SOURCE) && defined(__OPTIMIZE__)
 # define _FORTIFY_SOURCE 2
 #endif
@@ -64,7 +133,10 @@
 #include <time.h>
 #include <unistd.h>
 
-/* aeltere Kernel-Header (musl, RHEL 8) kennen die Nummern noch nicht */
+/*
+ * Older kernel headers (musl, RHEL 8) lack these syscall numbers. They are the
+ * same on every architecture except alpha.
+ */
 #ifndef SYS_pidfd_open
 # ifdef __alpha__
 #  define SYS_pidfd_open 544
@@ -82,24 +154,34 @@
 
 #define NAME            "caffeinate"
 #define POWER_DIR       "/sys/class/power_supply"
-#define AC_POLL_MS      5000	/* Netzteil-Abfrage fuer -s */
-#define PID_POLL_MS     1000	/* -w ohne pidfd (Kernel < 5.3) */
-#define CALL_TIMEOUT_MS 5000
-#define SETTLE_MS       500	/* neu gestarteter Dienst: warten, bis er Aufrufe annimmt */
-#define RETRY_MS        5000	/* ... und einmal nachfassen, falls er dann noch nicht so weit war */
-#define LOST_RETRY_MS   60000	/* ganz ohne Sperre: so oft neu versuchen */
-#define FOREVER         (-1LL)
-#define MAX_TIMEOUT_S   3155760000UL	/* 100 Jahre; mehr gilt als unendlich */
+#define AC_POLL_MS      5000	/* -s: interval of the power supply check */
+#define PID_POLL_MS     1000	/* -w without pidfd (kernel < 5.3): interval of the pid check */
+#define CALL_TIMEOUT_MS 5000	/* longest wait for a D-Bus reply or for the X server */
+#define SETTLE_MS       500	/* a service was just (re)started: wait until it accepts calls */
+#define RETRY_MS        5000	/* ... and try once more in case it was not ready by then */
+#define LOST_RETRY_MS   60000	/* no lock at all: retry this often */
+#define FOREVER         (-1LL)	/* "no deadline", for every timestamp below */
+#define MAX_TIMEOUT_S   3155760000UL	/* 100 years; anything longer counts as infinite */
 
+/* Set by CAFFEINATE_DEBUG: trace every step on stderr */
 static bool debug;
 
+/* Debug trace in printf style; the newline is added here */
 #define DBG(...) do { if (debug) { fprintf(stderr, NAME ": " __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
 /* ---------------------------------------------------------------- Assertions */
 
+/*
+ * An "assertion" (Apple's term) is one request to keep something awake. There
+ * is one slot per type, that is per command line flag: -i, -d, -s, -u, -m.
+ */
 enum { A_IDLE, A_DISPLAY, A_SYSTEM, A_USER, A_DISK, A_COUNT };
 
-/* Reihenfolge wie assertionMap bei Apple - wichtig fuer den -u-Timeout */
+/*
+ * Names as Apple prints them, in the order of Apple's assertionMap. The order
+ * matters: assertions are created in it, and the implicit 5 s timeout of -u
+ * carries over to those after it (see create_assertions()).
+ */
 static const char *const type_name[A_COUNT] = {
 	"PreventUserIdleSystemSleep",
 	"PreventUserIdleDisplaySleep",
@@ -108,43 +190,62 @@ static const char *const type_name[A_COUNT] = {
 	"PreventDiskIdle",
 };
 
+/*
+ * A desktop service on the session bus that hands out inhibitor locks: calling
+ * iface.Inhibit on object path of bus name dest returns a cookie, and
+ * iface.<uninhibit>(cookie) gives the lock back. Inhibit comes in two flavours:
+ * the freedesktop services take (application, reason), signature "ss";
+ * org.gnome.SessionManager takes (application, window id, reason, flags),
+ * signature "susu".
+ */
 struct backend {
 	const char *dest, *path, *iface, *uninhibit;
-	uint32_t gsm_flags;	/* 0: freedesktop-Signatur (ss), sonst SessionManager (susu) */
+	uint32_t gsm_flags;	/* 0: freedesktop flavour; else SessionManager with these flags */
 };
 
+/* What to inhibit: flags of org.gnome.SessionManager.Inhibit */
 #define GSM_SUSPEND 4
 #define GSM_IDLE    8
 #define FDO_SS      "org.freedesktop.ScreenSaver"
 #define XFCE_SS     "org.xfce.ScreenSaver"
 #define FDO_PM      "org.freedesktop.PowerManagement"
+/* Object path, interface and release method, common to both power managers */
 #define PM_INHIBIT  "/org/freedesktop/PowerManagement/Inhibit", FDO_PM ".Inhibit", "UnInhibit"
-/* auch Cinnamon und MATE: deren Session-Manager melden sich unter dem GNOME-Namen */
+/* Also Cinnamon and MATE: their session managers answer to the GNOME name */
 #define GNOME_SM    "org.gnome.SessionManager", "/org/gnome/SessionManager", "org.gnome.SessionManager", "Uninhibit"
 
 /*
- * Reihenfolge = Vorrang. XFCE zuerst: xfce4-power-manager schaltet per DPMS
- * ab und haelt, solange es gesperrt ist, auch den Bildschirmschoner an (ob
- * xfce4-screensaver oder light-locker). Deren eigene Sperre liesse DPMS und
- * den Leerlauf-Ruhezustand laufen und zaehlt nur, wenn der Power-Manager fehlt.
+ * Backends for -d and -u. Order is priority: the first one running wins. XFCE
+ * comes first because xfce4-power-manager is what blanks the screen there (via
+ * DPMS), and while it is inhibited it also holds off the screen saver, be it
+ * xfce4-screensaver or light-locker. A lock taken from those screen savers
+ * themselves would leave DPMS and suspend-on-idle running, so it only counts
+ * when the power manager is absent.
  */
 static const struct backend display_backends[] = {
 	{ "org.xfce.PowerManager", PM_INHIBIT, 0 },
 	{ FDO_SS, "/org/freedesktop/ScreenSaver", FDO_SS, "UnInhibit", 0 },
-	{ FDO_SS, "/ScreenSaver", FDO_SS, "UnInhibit", 0 },	/* manche Dienste kennen nur diesen Pfad */
+	{ FDO_SS, "/ScreenSaver", FDO_SS, "UnInhibit", 0 },	/* some services only export this path */
 	{ XFCE_SS, "/org/xfce/ScreenSaver", XFCE_SS, "UnInhibit", 0 },
 	{ GNOME_SM, GSM_IDLE },
 	{ NULL, NULL, NULL, NULL, 0 }
 };
 
-/* PowerDevil (KDE) und xfce4-power-manager; nur KDE besitzt auch den Namen "...Inhibit" */
+/*
+ * Backends for -i. org.freedesktop.PowerManagement is owned by PowerDevil (KDE)
+ * and by xfce4-power-manager; only KDE also owns the name "...Inhibit".
+ */
 static const struct backend system_backends[] = {
 	{ FDO_PM, PM_INHIBIT, 0 },
 	{ GNOME_SM, GSM_SUSPEND },
 	{ NULL, NULL, NULL, NULL, 0 }
 };
 
-/* logind, elogind und ConsoleKit2: Inhibit(what, who, why, mode) -> fd */
+/*
+ * Login managers on the system bus, tried in this order; systemd-logind and
+ * elogind share the first name. Inhibit(what, who, why, mode) returns a file
+ * descriptor, and the lock lasts exactly as long as that descriptor is open.
+ */
 static const struct {
 	const char *dest, *path, *iface;
 } seat_managers[] = {
@@ -153,31 +254,37 @@ static const struct {
 	  "org.freedesktop.ConsoleKit.Manager" },
 };
 
+/*
+ * State of one assertion. "active" is what the user wants; be/cookie, fd and
+ * xfd say what currently enforces it. More than one can be set: -d under a
+ * bare X11 window manager, for example, holds both fd (logind) and xfd.
+ */
 struct assertion {
-	bool active;
-	bool stale;			/* Dienst neu gestartet: Sperre neu anlegen */
-	bool lost;			/* zurzeit ganz ohne Sperre, schon gemeldet */
-	long long expires;		/* CLOCK_MONOTONIC in ms oder FOREVER */
-	const struct backend *be;	/* Session-Bus-Sperre */
-	uint32_t cookie;
-	int fd;				/* logind-Sperre */
-	int xfd;			/* Verbindung zum X-Server, die dessen Bildschirmschoner aussetzt */
+	bool active;			/* requested, and neither expired nor released */
+	bool stale;			/* service gone, or a better one came: refresh is due */
+	bool lost;			/* nothing enforces it right now; already reported */
+	long long expires;		/* CLOCK_MONOTONIC in ms, or FOREVER */
+	const struct backend *be;	/* desktop service that holds the lock, or NULL */
+	uint32_t cookie;		/* ... and the cookie that identifies the lock there */
+	int fd;				/* logind inhibitor fd, or -1 */
+	int xfd;			/* X connection that suspends the screen saver, or -1 */
 };
 
-static struct assertion as[A_COUNT];
-static long long refresh_at = FOREVER;	/* wann stale-Sperren neu angelegt werden */
-static bool retry;			/* danach noch einmal nachfassen */
-static unsigned owner_changes;		/* wie oft einer Sperre ihr Dienst abhanden kam */
-static const char *inflight_dest;	/* Dienst, bei dem gerade ein Inhibit laeuft, ... */
-static char inflight_owner[64];		/* ... sein neuer Besitzer, falls der Name dabei gewandert ist */
-static bool inflight_hit;
-static char last_sender[64];		/* Absender der letzten Antwort (eindeutiger Busname) */
-static char details[160];
-static char reason[256];		/* warum der letzte Aufruf scheiterte */
-static enum { E_OTHER, E_ABSENT, E_DENIED } failure;	/* ... und auf welche Art */
+static struct assertion as[A_COUNT];	/* indexed by A_* */
+static long long refresh_at = FOREVER;	/* when refresh_assertions() is due, or FOREVER */
+static bool retry;			/* that refresh gets one follow-up attempt */
+static unsigned owner_changes;		/* counts every time a lock loses its service */
+static const char *inflight_dest;	/* service with an Inhibit call in flight, ... */
+static char inflight_owner[64];		/* ... its new owner if the name changed hands, ... */
+static bool inflight_hit;		/* ... and whether that happened */
+static char last_sender[64];		/* sender of the last reply (unique bus name) */
+static char details[160];		/* the "why" text services show in their lock lists */
+static char reason[256];		/* why the last call failed, set by fail() */
+static enum { E_OTHER, E_ABSENT, E_DENIED } failure;	/* ... and what kind of failure it was */
 
-/* ---------------------------------------------------------------- Hilfen */
+/* ---------------------------------------------------------------- Helpers */
 
+/* Monotonic clock in milliseconds: the time base of every deadline in this file */
 static long long now_ms(void)
 {
 	struct timespec ts;
@@ -186,7 +293,7 @@ static long long now_ms(void)
 	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* Ablaufzeitpunkt fuer einen Timeout in Sekunden; 0 = kein Timeout */
+/* Deadline for a timeout given in seconds; 0 (or absurdly long) means none */
 static long long expiry_after(long secs)
 {
 	if (secs <= 0 || (unsigned long)secs > MAX_TIMEOUT_S)
@@ -194,17 +301,23 @@ static long long expiry_after(long secs)
 	return now_ms() + (long long)secs * 1000;
 }
 
+/* pidfd_open(2), called directly because glibc only wraps it since 2.36 */
 static int sys_pidfd_open(pid_t pid)
 {
 	return (int)syscall(SYS_pidfd_open, pid, 0);
 }
 
+/* Apple's usage line, verbatim */
 static void usage(void)
 {
 	fprintf(stderr, "usage: caffeinate [-disu] [-t timeout] [-w Process ID] [command arguments...]\n");
 }
 
-/* Grund fuer einen Fehlschlag merken; Text von Diensten kommt ungeprueft herein */
+/*
+ * Remember why something failed, for the message to the user. Text from
+ * services arrives unchecked, so control characters are replaced before it can
+ * reach a terminal.
+ */
 __attribute__((format(printf, 1, 2)))
 static void fail(const char *fmt, ...)
 {
@@ -220,9 +333,9 @@ static void fail(const char *fmt, ...)
 }
 
 /*
- * strtol(s, NULL, 0) wie auf macOS: dort setzt strtol bei "keine Ziffer"
- * errno = EINVAL, glibc und musl nicht. Liefert false, wenn Apple hier
- * usage() aufruft.
+ * strtol(s, NULL, 0) with macOS semantics: there strtol sets errno = EINVAL
+ * when it finds no digit; glibc and musl do not. Returns false in exactly the
+ * cases where Apple's caffeinate calls usage().
  */
 static bool mac_strtol(const char *s, long *out)
 {
@@ -236,11 +349,12 @@ static bool mac_strtol(const char *s, long *out)
 }
 
 /*
- * D-Bus verlangt gueltiges UTF-8, der Bus trennt sonst die Verbindung. Der
- * Befehlsname kann beliebige Bytes enthalten (Latin-1-Dateinamen) und wird
- * in details ggf. mitten in einem Zeichen abgeschnitten: ungueltige Bytes
- * werden zu '?', ein abgeschnittenes Zeichen am Ende faellt weg. Geprueft
- * wird so streng wie aeltere libdbus (keine Surrogates, keine Nichtzeichen).
+ * D-Bus requires valid UTF-8; the bus disconnects a client that sends anything
+ * else. The command name may contain arbitrary bytes (Latin-1 file names) and
+ * may have been cut off in the middle of a character when it was copied into
+ * details[]. Invalid bytes become '?', a truncated character at the end is
+ * dropped. The check is as strict as that of older libdbus versions (no
+ * surrogates, no noncharacters).
  */
 static void utf8_sanitize(char *s)
 {
@@ -255,7 +369,7 @@ static void utf8_sanitize(char *s)
 		for (i = 1; i < n && (p[i] & 0xC0) == 0x80; i++)
 			cp = (cp << 6) | (p[i] & 0x3Fu);
 		if (n > 1 && i < n && p[i] == '\0') {
-			*p = '\0';		/* abgeschnittenes Zeichen am Ende */
+			*p = '\0';		/* truncated character at the end */
 			return;
 		}
 		bool ok = n > 0 && i == n &&
@@ -270,7 +384,11 @@ static void utf8_sanitize(char *s)
 	}
 }
 
-/* Alle geerbten fds ausser 0-2 und keep schliessen (wie Apple im Kind). */
+/*
+ * Close every inherited fd except 0-2 and keep, as Apple does in the child.
+ * keep is moved to fd 3 if necessary; returns its new number, or -1 if there is
+ * none. Uses close_range(2), else /proc/self/fd, else a plain loop.
+ */
 static int close_inherited_fds(int keep)
 {
 	if (keep >= 0 && keep != 3) {
@@ -309,38 +427,64 @@ static int close_inherited_fds(int keep)
 /* ---------------------------------------------------------------- D-Bus */
 
 /*
- * Minimaler D-Bus-Client statt libdbus. Er kann genau das, was hier noetig
- * ist: Anmeldung per EXTERNAL, Methodenaufrufe mit Argumenten vom Typ s und
- * u, Antworten mit u oder h (fd per SCM_RIGHTS) und das Signal
- * NameOwnerChanged. Gesendet wird little-endian, gelesen beides.
+ * A minimal D-Bus client in place of libdbus. It does exactly what this program
+ * needs: EXTERNAL authentication, method calls with arguments of type s
+ * (string) and u (uint32), replies carrying a u or an h (a file descriptor,
+ * passed via SCM_RIGHTS), and the NameOwnerChanged signal. Messages are sent
+ * little-endian and read in either byte order.
+ *
+ * Layout of a message (D-Bus specification, "Message Protocol"):
+ *
+ *   offset 0   byte    byte order: 'l' or 'B'
+ *          1   byte    message type (M_*)
+ *          2   byte    flags
+ *          3   byte    protocol version, 1
+ *          4   uint32  length of the body
+ *          8   uint32  serial number of this message
+ *         12   uint32  length of the header fields
+ *         16   ...     header fields: pairs of a code (F_*) and a variant,
+ *                      each pair aligned to 8 bytes
+ *              ...     padding to 8 bytes, then the body
+ *
+ * Every value is aligned to its own size. A string is a uint32 length, the
+ * bytes and a terminating NUL; a signature is the same with a one-byte length.
+ *
+ * All traffic is synchronous: call() sends a request and reads messages until
+ * the matching reply arrives. Whatever else comes in meanwhile, and whatever
+ * the main loop finds between calls, goes to bus_other().
  */
 
 #define DBUS_NAME     "org.freedesktop.DBus"
 #define DBUS_PATH     "/org/freedesktop/DBus"
-#define NO_AUTO_START 2
-#define MAX_FIELDS    (1u << 26)	/* Grenzen der Spezifikation */
+#define NO_AUTO_START 2			/* message flag: do not start the service */
+#define MAX_FIELDS    (1u << 26)	/* limits set by the specification */
 #define MAX_BODY      (1u << 27)
 
+/* Message types and header field codes, numbered as in the specification */
 enum { M_CALL = 1, M_RETURN, M_ERROR, M_SIGNAL };
 enum { F_PATH = 1, F_IFACE, F_MEMBER, F_ERROR, F_REPLY_SERIAL, F_DEST, F_SENDER, F_SIGNATURE, F_UNIX_FDS };
 
+/* One bus connection, together with the state of its incremental reader */
 struct bus {
-	const char *what;		/* fuer Meldungen */
-	int fd;				/* -1: nicht verbunden */
-	bool tried;
-	uint32_t serial;
-	unsigned char in[4096];		/* die Nachricht, die gerade gelesen wird */
-	size_t have;			/* Bytes davon in in[] */
-	size_t skip;			/* Rest einer zu grossen Nachricht, die ueberlesen wird */
-	bool done;			/* Nachricht ist ausgeliefert, mit dem naechsten Lesen beginnt eine neue */
-	int fds[4];			/* per SCM_RIGHTS mit dieser Nachricht gekommen */
+	const char *what;		/* name used in messages */
+	int fd;				/* socket, or -1 when not connected */
+	bool tried;			/* a connection attempt was made; it is not repeated */
+	uint32_t serial;		/* serial number of the last message sent */
+	unsigned char in[4096];		/* the message that is being read */
+	size_t have;			/* bytes of it already in in[] */
+	size_t skip;			/* rest of an oversized message that is being skipped */
+	bool done;			/* in[] was handed out; the next read starts afresh */
+	int fds[4];			/* fds that arrived with this message (SCM_RIGHTS) */
 	int nfds;
 };
 
 static struct bus user_bus = { .what = "Session-Bus", .fd = -1 };
 static struct bus sys_bus = { .what = "System-Bus", .fd = -1 };
 
-/* empfangene Nachricht; die Zeiger gelten bis zum naechsten bus_next() */
+/*
+ * A received message. The pointers refer into bus.in[] and stay valid until the
+ * next bus_next().
+ */
 struct message {
 	int type;
 	bool big;			/* big-endian */
@@ -350,21 +494,27 @@ struct message {
 	size_t body_len;
 };
 
-/* ausgehende Nachricht */
+/*
+ * An outgoing message under construction. Instead of writing past buf, put()
+ * sets overflow; call() checks it once before sending.
+ */
 struct out {
 	unsigned char buf[1024];
 	size_t len;
 	bool overflow;
 };
 
+/* Part of the state machine further down; called for every NameOwnerChanged */
 static void name_changed(const char *name, const char *new_owner);
 
+/* Read a uint32 in the byte order of the message it comes from */
 static uint32_t rd32(const unsigned char *p, bool big)
 {
 	return big ? (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]
 	           : (uint32_t)p[3] << 24 | (uint32_t)p[2] << 16 | (uint32_t)p[1] << 8 | p[0];
 }
 
+/* Store a uint32 little-endian */
 static void set32(unsigned char *p, size_t v)
 {
 	p[0] = (unsigned char)v;
@@ -373,6 +523,7 @@ static void set32(unsigned char *p, size_t v)
 	p[3] = (unsigned char)(v >> 24);
 }
 
+/* put*(): append to an outgoing message, with the alignment D-Bus requires */
 static void put(struct out *o, const void *data, size_t n)
 {
 	if (n > sizeof o->buf - o->len) {
@@ -404,7 +555,7 @@ static void put_u32(struct out *o, uint32_t v)
 	put(o, b, 4);
 }
 
-static void put_str(struct out *o, const char *s)	/* Typ s und o */
+static void put_str(struct out *o, const char *s)	/* types s and o */
 {
 	size_t n = strlen(s);
 
@@ -412,7 +563,7 @@ static void put_str(struct out *o, const char *s)	/* Typ s und o */
 	put(o, s, n + 1);
 }
 
-static void put_sig(struct out *o, const char *s)	/* Typ g */
+static void put_sig(struct out *o, const char *s)	/* type g (signature) */
 {
 	size_t n = strlen(s);
 
@@ -420,6 +571,7 @@ static void put_sig(struct out *o, const char *s)	/* Typ g */
 	put(o, s, n + 1);
 }
 
+/* One header field: its code, then a variant holding val (type 's', 'o' or 'g') */
 static void put_field(struct out *o, unsigned char code, char type, const char *val)
 {
 	const char sig[2] = { type, '\0' };
@@ -433,7 +585,7 @@ static void put_field(struct out *o, unsigned char code, char type, const char *
 		put_str(o, val);
 }
 
-/* fds der aktuellen Nachricht schliessen, soweit sie niemand abgeholt hat */
+/* Close those fds of the current message that nobody has taken over */
 static void bus_drop_fds(struct bus *b)
 {
 	while (b->nfds > 0)
@@ -441,6 +593,7 @@ static void bus_drop_fds(struct bus *b)
 			close(b->fds[b->nfds]);
 }
 
+/* Drop the connection and reset the reader. Locks held through it are gone. */
 static void bus_kill(struct bus *b)
 {
 	if (b->fd >= 0)
@@ -451,7 +604,7 @@ static void bus_kill(struct bus *b)
 	b->done = false;
 }
 
-/* Auf fd warten, laengstens bis deadline; false bei Timeout */
+/* Wait for events on fd, until deadline at most; false on timeout or error */
 static bool wait_fd(int fd, short events, long long deadline)
 {
 	for (;;) {
@@ -469,7 +622,7 @@ static bool wait_fd(int fd, short events, long long deadline)
 	}
 }
 
-/* Alles senden, laengstens bis deadline */
+/* Send everything, until deadline at most */
 static bool send_all(int fd, const void *data, size_t len, long long deadline)
 {
 	const unsigned char *p = data;
@@ -488,7 +641,7 @@ static bool send_all(int fd, const void *data, size_t len, long long deadline)
 	return true;
 }
 
-/* Genau len Bytes lesen, laengstens bis deadline; buf == NULL: verwerfen */
+/* Read exactly len bytes, until deadline at most; buf == NULL discards them */
 static bool recv_all(int fd, void *buf, size_t len, long long deadline)
 {
 	unsigned char junk[256], *p = buf;
@@ -508,20 +661,22 @@ static bool recv_all(int fd, void *buf, size_t len, long long deadline)
 	return true;
 }
 
+/* Send one complete message or authentication line */
 static bool bus_send(struct bus *b, const void *data, size_t len)
 {
 	if (send_all(b->fd, data, len, now_ms() + CALL_TIMEOUT_MS))
 		return true;
 	DBG("%s: Senden fehlgeschlagen", b->what);
-	bus_kill(b);	/* halb gesendete Nachricht: Verbindung unbrauchbar */
+	bus_kill(b);	/* a half-sent message leaves the stream unusable */
 	return false;
 }
 
 /*
- * Hoechstens want Bytes hinter die schon gelesenen holen: 1 = gelesen,
- * 0 = Timeout, -1 = Verbindung weg. Der Aufrufer liest nie ueber das Ende
- * einer Nachricht hinaus. fds reisen mit dem ersten Byte ihrer Nachricht,
- * was hier ankommt, gehoert also immer zu der, die gerade gelesen wird.
+ * Fetch at most want more bytes of the current message: 1 = got some,
+ * 0 = timeout, -1 = connection lost. Callers never ask for more than the
+ * current message has left. That is what makes fd passing safe: fds travel
+ * with the first byte of their message, so whatever arrives here always
+ * belongs to the message being read, never to the next one.
  */
 static int bus_recv(struct bus *b, size_t want, long long deadline)
 {
@@ -539,7 +694,7 @@ static int bus_recv(struct bus *b, size_t want, long long deadline)
 		ssize_t n = recvmsg(b->fd, &mh, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
 
 		if (n > 0) {
-			/* je recvmsg() kommt hoechstens eine Kontrollnachricht, die mit den fds */
+			/* a recvmsg() returns at most one control message: the one with the fds */
 			struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
 
 			if (c && c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
@@ -569,7 +724,10 @@ static int bus_recv(struct bus *b, size_t want, long long deadline)
 	}
 }
 
-/* Ausrichtung eines D-Bus-Typs, bei denen fester Groesse zugleich diese; 0 = unbekannt */
+/*
+ * Alignment of a D-Bus type; for the fixed-size types this is also their size.
+ * 0 = unknown type.
+ */
 static size_t type_align(int type)
 {
 	switch (type) {
@@ -587,10 +745,11 @@ static size_t type_align(int type)
 }
 
 /*
- * Headerfelder einer vollstaendig gelesenen Nachricht auswerten. Felder,
- * die hier niemand kennt, werden uebersprungen, soweit ihr Typ einfach oder
- * ein Array ist; bei Strukturen und Varianten (in keinem definierten Feld
- * verwendet) ist Schluss.
+ * Decode the header fields of a completely read message into m. Fields that
+ * nobody here needs are skipped as long as their type is basic or an array; a
+ * struct or variant (used by no field the specification defines) ends the
+ * parse. So does malformed input: what was decoded up to that point stays, the
+ * rest of m remains zero.
  */
 static void parse_fields(const unsigned char *p, size_t fields_len, struct message *m)
 {
@@ -603,7 +762,7 @@ static void parse_fields(const unsigned char *p, size_t fields_len, struct messa
 		size_t align;
 		unsigned char code, type;
 
-		/* Feld = Code, Signatur, Wert; jedes beginnt auf einer 8er-Grenze */
+		/* field = code, signature, value; each one starts on an 8-byte boundary */
 		i = (i + 7) & ~(size_t)7;
 		if (i + 4 > end)
 			return;
@@ -626,7 +785,7 @@ static void parse_fields(const unsigned char *p, size_t fields_len, struct messa
 			n = rd32(p + i, m->big);
 			i += 4;
 			if (type == 'a') {
-				/* Laenge in Bytes ab dem ersten, ausgerichteten Element */
+				/* length in bytes, counted from the first (aligned) element */
 				align = type_align(sig[1]);
 				if (!align)
 					return;
@@ -669,26 +828,31 @@ static void parse_fields(const unsigned char *p, size_t fields_len, struct messa
 	}
 }
 
-/* Naechste Nachricht liefern: 1 = da, 0 = Timeout, -1 = Verbindung weg */
+/*
+ * Deliver the next message: 1 = m is filled, 0 = timeout, -1 = connection lost.
+ * Reading resumes where the previous call stopped, so a deadline of 0 makes
+ * this a non-blocking poll. A message is read in two steps - the fixed 16-byte
+ * header, then exactly the rest - and never beyond its end.
+ */
 static int bus_next(struct bus *b, long long deadline, struct message *m)
 {
 	for (;;) {
 		int r;
 
 		if (b->done) {
-			/* die letzte ist verarbeitet; fds, die niemand abgeholt hat, verfallen */
+			/* the previous message is done with; fds nobody took over are closed */
 			b->done = false;
 			b->have = 0;
 			bus_drop_fds(b);
 		}
 		if (b->skip) {
-			/* Rest einer zu grossen Nachricht verwerfen, samt ihrer fds */
+			/* discard the rest of an oversized message, along with its fds */
 			if ((r = bus_recv(b, b->skip < sizeof b->in ? b->skip : sizeof b->in, deadline)) <= 0)
 				return r;
 			b->skip -= b->have;
 			b->have = 0;
 			bus_drop_fds(b);
-			/* auch ein ununterbrochener Strom haelt den Aufrufer nicht ueber die Frist hinaus fest */
+			/* not even an endless stream may hold the caller past its deadline */
 			if (b->skip && now_ms() >= deadline)
 				return 0;
 			continue;
@@ -712,7 +876,7 @@ static int bus_next(struct bus *b, long long deadline, struct message *m)
 		size_t total = body_off + body_len;
 
 		if (total > sizeof b->in) {
-			/* erwartet hier niemand; fremde Nachricht ueberlesen */
+			/* no reply awaited here is that large: skip the message */
 			DBG("%s: Nachricht mit %zu Bytes uebergangen", b->what, total);
 			b->skip = total - b->have;
 			b->have = 0;
@@ -735,7 +899,7 @@ static int bus_next(struct bus *b, long long deadline, struct message *m)
 	}
 }
 
-/* Naechstes Argument vom Typ s aus dem Body; NULL, wenn keins mehr da ist */
+/* Next argument of type s from the body, advancing *off; NULL if there is none */
 static const char *body_str(const struct message *m, size_t *off)
 {
 	size_t i = (*off + 3) & ~(size_t)3;
@@ -751,13 +915,16 @@ static const char *body_str(const struct message *m, size_t *off)
 	return (const char *)m->body + i;
 }
 
-/* Alles, was keine Antwort auf den laufenden Aufruf ist */
+/*
+ * Handle a message that is not the reply to the call in progress. Only one
+ * kind matters: NameOwnerChanged from the bus itself.
+ */
 static void bus_other(struct bus *b, const struct message *m)
 {
 	size_t off = 0;
 	const char *name, *new_owner;
 
-	/* NameOwnerChanged(Name, alter Besitzer, neuer Besitzer) */
+	/* NameOwnerChanged(name, old owner, new owner) */
 	if (b == &user_bus && m->type == M_SIGNAL &&
 	    m->sender && !strcmp(m->sender, DBUS_NAME) &&
 	    m->member && !strcmp(m->member, "NameOwnerChanged") &&
@@ -768,11 +935,18 @@ static void bus_other(struct bus *b, const struct message *m)
 }
 
 /*
- * Methodenaufruf, blockierend bis zur Antwort. sig beschreibt die Argumente:
- * 's' = const char *, 'u' = uint32_t. want ist der Typ des erwarteten
- * Rueckgabewerts: 'u' (out = uint32_t *), 'h' (out = int *, fd mit CLOEXEC)
- * oder 0 = keiner. autostart = false: keine Desktop-Dienste per
- * D-Bus-Aktivierung hochfahren, nur laufende nutzen.
+ * Method call, blocking until the reply arrives or CALL_TIMEOUT_MS has passed.
+ *
+ * sig describes the arguments that follow it: 's' = const char *,
+ * 'u' = uint32_t. want is the type of the expected return value: 'u'
+ * (out = uint32_t *), 'h' (out = int *; receives an fd with CLOEXEC set, which
+ * the caller then owns) or 0 for none. autostart = false: do not let the bus
+ * launch the service (D-Bus activation), only talk to it if it is running.
+ *
+ * Returns false on any failure; "reason" then says why and "failure" what
+ * kind it was. Messages that arrive ahead of the reply go to bus_other(),
+ * which may run name_changed() - the assertion state can change during any
+ * call().
  */
 static bool call(struct bus *b, bool autostart, const char *dest, const char *path,
                  const char *iface, const char *member, char want, void *out,
@@ -791,10 +965,10 @@ static bool call(struct bus *b, bool autostart, const char *dest, const char *pa
 	put_byte(&o, 'l');
 	put_byte(&o, M_CALL);
 	put_byte(&o, autostart ? 0 : NO_AUTO_START);
-	put_byte(&o, 1);		/* Protokollversion */
-	put_u32(&o, 0);			/* Laenge des Body, siehe unten */
+	put_byte(&o, 1);		/* protocol version */
+	put_u32(&o, 0);			/* length of the body, filled in below */
 	put_u32(&o, serial);
-	put_u32(&o, 0);			/* Laenge der Headerfelder, siehe unten */
+	put_u32(&o, 0);			/* length of the header fields, filled in below */
 	put_field(&o, F_PATH, 'o', path);
 	put_field(&o, F_DEST, 's', dest);
 	put_field(&o, F_IFACE, 's', iface);
@@ -824,7 +998,7 @@ static bool call(struct bus *b, bool autostart, const char *dest, const char *pa
 	long long deadline = now_ms() + CALL_TIMEOUT_MS;
 
 	for (;;) {
-		/* die Frist gilt auch, wenn laufend fremde Nachrichten eintreffen */
+		/* the deadline also holds while unrelated messages keep arriving */
 		int r = now_ms() < deadline ? bus_next(b, deadline, &m) : 0;
 
 		if (r <= 0) {
@@ -846,7 +1020,7 @@ static bool call(struct bus *b, bool autostart, const char *dest, const char *pa
 
 		if (m.error && (!strcmp(m.error, DBUS_NAME ".Error.ServiceUnknown") ||
 		                !strcmp(m.error, DBUS_NAME ".Error.NameHasNoOwner")))
-			failure = E_ABSENT;	/* den Dienst gibt es nicht */
+			failure = E_ABSENT;	/* there is no such service */
 		else if (m.error && !strcmp(m.error, DBUS_NAME ".Error.AccessDenied"))
 			failure = E_DENIED;
 		fail("%s.%s: %s", iface, member, text ? text : m.error ? m.error : "Fehler");
@@ -855,7 +1029,7 @@ static bool call(struct bus *b, bool autostart, const char *dest, const char *pa
 
 		ok = m.sig && m.sig[0] == want && m.body_len >= 4;
 		if (ok && want == 'h') {
-			/* der Wert ist der Index in die fds dieser Nachricht */
+			/* the value is an index into the fds that came with this message */
 			ok = v < (uint32_t)b->nfds && b->fds[v] >= 0;
 			if (ok) {
 				*(int *)out = b->fds[v];
@@ -871,12 +1045,13 @@ static bool call(struct bus *b, bool autostart, const char *dest, const char *pa
 	return ok;
 }
 
+/* Connect to a unix stream socket (CLOEXEC); returns the fd or -1 */
 static int unix_connect(const char *name, size_t len, bool abstract)
 {
 	struct sockaddr_un sa = { .sun_family = AF_UNIX };
 	int fd;
 
-	/* Pfad mit abschliessender, abstrakter Name mit fuehrender Null */
+	/* a path ends with a NUL byte, an abstract name starts with one */
 	if (len == 0 || len + 1 > sizeof sa.sun_path)
 		return -1;
 	memcpy(sa.sun_path + abstract, name, len);
@@ -891,13 +1066,17 @@ static int unix_connect(const char *name, size_t len, bool abstract)
 	return fd;
 }
 
+/* Value of a hex digit, or -1 */
 static int hexval(int c)
 {
 	return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 :
 	       c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
 }
 
-/* Wert eines Adress-Schluessels dekodieren (%XX); liefert die Laenge, 0 bei Fehler */
+/*
+ * Decode the value of a bus address key (%XX escapes) into out; returns its
+ * length, 0 on error.
+ */
 static size_t addr_value(const char *s, const char *end, char *out, size_t max)
 {
 	size_t len = 0;
@@ -919,10 +1098,10 @@ static size_t addr_value(const char *s, const char *end, char *out, size_t max)
 }
 
 /*
- * D-Bus-Adresse wie "unix:path=/run/user/1000/bus" oder
- * "unix:abstract=/tmp/dbus-X,guid=...;unix:path=..." durchgehen und den
- * ersten erreichbaren Unix-Socket nehmen. Andere Transporte werden
- * uebergangen - autolaunch wuerde per SSH ggf. einen dbus-daemon starten.
+ * Walk a D-Bus address such as "unix:path=/run/user/1000/bus" or
+ * "unix:abstract=/tmp/dbus-X,guid=...;unix:path=..." and connect to the first
+ * unix socket that accepts. Other transports are skipped on purpose:
+ * "autolaunch:", for one, might start a dbus-daemon in an SSH session.
  */
 static int addr_connect(const char *addr)
 {
@@ -951,7 +1130,10 @@ static int addr_connect(const char *addr)
 	return -1;
 }
 
-/* Eine Zeile der Anmeldung senden und, wenn reply gesetzt ist, die Antwortzeile lesen */
+/*
+ * Send one line of the authentication handshake and, if reply is set, read the
+ * server's answer line into it.
+ */
 static bool sasl(struct bus *b, const char *cmd, size_t len, char *reply, size_t max)
 {
 	long long deadline = now_ms() + CALL_TIMEOUT_MS;
@@ -961,7 +1143,7 @@ static bool sasl(struct bus *b, const char *cmd, size_t len, char *reply, size_t
 		return false;
 	if (!reply)
 		return true;
-	/* byteweise: hinter der Zeile darf nichts vom Nachrichtenstrom verloren gehen */
+	/* byte by byte: nothing of the message stream behind the line may be swallowed */
 	for (;;) {
 		char c;
 		ssize_t r = recv(b->fd, &c, 1, MSG_DONTWAIT);
@@ -983,7 +1165,11 @@ static bool sasl(struct bus *b, const char *cmd, size_t len, char *reply, size_t
 	return true;
 }
 
-/* Verbindung auf fd anmelden; bei Fehlschlag ist fd geschlossen */
+/*
+ * Authenticate on the freshly connected socket fd and say Hello, which makes
+ * the bus assign our unique name. The handshake is the line-based SASL exchange
+ * of the specification. On failure fd is closed and b->fd is -1.
+ */
 static bool bus_open(struct bus *b, int fd)
 {
 	char uid[16], cmd[64], line[256];
@@ -994,7 +1180,7 @@ static bool bus_open(struct bus *b, int fd)
 	if (fd < 0)
 		return false;
 
-	/* Null-Byte, dann EXTERNAL mit der uid als Hex-Text */
+	/* a NUL byte, then EXTERNAL with our uid as hex-encoded text */
 	cmd[len++] = '\0';
 	len += (size_t)snprintf(cmd + len, sizeof cmd - len, "AUTH EXTERNAL ");
 	for (int i = 0; i < digits; i++)
@@ -1004,13 +1190,13 @@ static bool bus_open(struct bus *b, int fd)
 	if (!sasl(b, cmd, len, line, sizeof line))
 		goto fail;
 	if (strncmp(line, "OK", 2) != 0) {
-		/* im User-Namespace (Container) kennt uns der Bus unter anderer uid:
-		 * ohne Angabe nimmt er die des Sockets */
+		/* in a user namespace (container) the bus knows us under a different
+		 * uid: asked without one, it takes the uid from the socket */
 		if (!sasl(b, "AUTH EXTERNAL\r\n", 15, line, sizeof line) || strncmp(line, "DATA", 4) != 0 ||
 		    !sasl(b, "DATA\r\n", 6, line, sizeof line) || strncmp(line, "OK", 2) != 0)
 			goto fail;
 	}
-	/* fd-Uebergabe fuer logind; lehnt der Bus ab, scheitert spaeter nur dessen Aufruf */
+	/* fd passing, for logind; if the bus refuses, only that call fails later */
 	if (!sasl(b, "NEGOTIATE_UNIX_FD\r\n", 19, line, sizeof line) ||
 	    !sasl(b, "BEGIN\r\n", 7, NULL, 0) ||
 	    !call(b, true, DBUS_NAME, DBUS_PATH, DBUS_NAME, "Hello", 0, NULL, ""))
@@ -1023,10 +1209,14 @@ fail:
 }
 
 /*
- * Session-Bus ohne X11-Autolaunch: DBUS_SESSION_BUS_ADDRESS, sonst der Bus
- * des systemd-Nutzerdienstes. Der hilft auch, wenn die Variable veraltet
- * ist (tmux, su), der Bus dort die Anmeldung ablehnt oder XDG_RUNTIME_DIR
- * fehlt (cron).
+ * The session bus, connected on first use; NULL if there is none. Never via X11
+ * autolaunch: DBUS_SESSION_BUS_ADDRESS first, then the bus of the systemd user
+ * instance at $XDG_RUNTIME_DIR/bus. The latter also helps when the variable is
+ * stale (tmux, su), when the bus named there rejects the login, or - as
+ * /run/user/<uid>/bus - when XDG_RUNTIME_DIR is missing (cron).
+ *
+ * Also subscribes to NameOwnerChanged for every backend name. That is how the
+ * program learns that a desktop service stopped, started or restarted.
  */
 static struct bus *get_user_bus(void)
 {
@@ -1058,7 +1248,7 @@ static struct bus *get_user_bus(void)
 		return NULL;
 	}
 
-	/* mitbekommen, wenn einer der Desktop-Dienste geht oder (neu) kommt */
+	/* get told when one of the desktop services goes away or (re)appears */
 	const char *seen[16];
 	size_t n = 0;
 
@@ -1070,7 +1260,7 @@ static struct bus *get_user_bus(void)
 			while (k < n && strcmp(seen[k], be->dest) != 0)
 				k++;
 			if (k < n || n == sizeof seen / sizeof *seen)
-				continue;	/* Name kommt in den Listen mehrfach vor */
+				continue;	/* the name occurs more than once in the lists */
 			seen[n++] = be->dest;
 			snprintf(rule, sizeof rule, "type='signal',sender='" DBUS_NAME "',path='" DBUS_PATH "',"
 			         "interface='" DBUS_NAME "',member='NameOwnerChanged',arg0='%s'", be->dest);
@@ -1080,6 +1270,7 @@ static struct bus *get_user_bus(void)
 	return b->fd >= 0 ? b : NULL;
 }
 
+/* The system bus, connected on first use; NULL if it cannot be reached */
 static struct bus *get_sys_bus(void)
 {
 	static const char *const paths[] = { "/run/dbus/system_bus_socket", "/var/run/dbus/system_bus_socket" };
@@ -1103,7 +1294,11 @@ static struct bus *get_sys_bus(void)
 	return b;
 }
 
-/* logind-Inhibitor; liefert einen fd (CLOEXEC) oder -1. */
+/*
+ * Take an inhibitor lock ("idle" or "sleep") from logind, elogind or
+ * ConsoleKit2. Returns the fd that holds the lock (CLOEXEC), or -1 with the
+ * cause in "reason".
+ */
 static int logind_inhibit(const char *what)
 {
 	struct bus *b = get_sys_bus();
@@ -1120,8 +1315,8 @@ static int logind_inhibit(const char *what)
 			DBG("%s.Inhibit(%s) -> fd %d", seat_managers[i].iface, what, fd);
 			return fd;
 		}
-		/* gemeldet wird der Grund des Dienstes, den es gibt - nicht, dass der andere fehlt.
-		 * Ohne polkit lehnt logind jeden ausser root ab. */
+		/* report the cause given by the manager that exists - not that the
+		 * other one is missing. Without polkit, logind refuses everyone but root. */
 		if (failure != E_ABSENT && !*why)
 			snprintf(why, sizeof why, "%s%s", reason,
 			         failure == E_DENIED ? " (polkit fehlt oder erlaubt die Sperre nicht)" : "");
@@ -1133,7 +1328,11 @@ static int logind_inhibit(const char *what)
 	return -1;
 }
 
-/* Erstes laufende Desktop-Backend der Liste nehmen; stop: nur die davor (NULL = alle). */
+/*
+ * Take a lock from the first running desktop service in list and record it in
+ * a (be, cookie). stop limits the search to the entries before it (NULL = all);
+ * that is how a move to a better backend is attempted.
+ */
 static bool sess_inhibit(const struct backend *list, const struct backend *stop, struct assertion *a)
 {
 	struct bus *b = get_user_bus();
@@ -1154,9 +1353,9 @@ static bool sess_inhibit(const struct backend *list, const struct backend *stop,
 		if (!ok)
 			continue;
 		if (inflight_hit && strcmp(inflight_owner, last_sender) != 0) {
-			/* Der Name ist waehrend des Aufrufs weitergewandert: Die Zusage
-			 * stammt nicht vom jetzigen Besitzer. Sie verfaellt mit unserer
-			 * Verbindung; name_changed() hat das Neuanlegen schon geplant. */
+			/* The name changed hands during the call: the grant does not come
+			 * from its present owner. It lapses with our connection;
+			 * name_changed() has already scheduled a new attempt. */
 			DBG("%s: Besitzer hat waehrend des Aufrufs gewechselt", be->dest);
 			continue;
 		}
@@ -1168,9 +1367,10 @@ static bool sess_inhibit(const struct backend *list, const struct backend *stop,
 	return false;
 }
 
+/* Give a desktop service its lock back, if a holds one */
 static void sess_uninhibit(struct assertion *a)
 {
-	const struct backend *be = a->be;	/* name_changed() kann a->be im Aufruf loeschen */
+	const struct backend *be = a->be;	/* name_changed() may clear a->be during the call */
 
 	if (!be)
 		return;
@@ -1179,7 +1379,7 @@ static void sess_uninhibit(struct assertion *a)
 	a->be = NULL;
 }
 
-/* -u: Bildschirm wecken, wo der Dienst das kann (KDE, XFCE) */
+/* -u: wake the screen where the service can do that (KDE, XFCE) */
 static void simulate_user_activity(void)
 {
 	struct bus *b = get_user_bus();
@@ -1193,25 +1393,37 @@ static void simulate_user_activity(void)
 /* ---------------------------------------------------------------- X11 */
 
 /*
- * Ohne Desktop-Dienst (i3, dwm, bspwm, Openbox ...) dunkelt der X-Server
- * selbst ab: Bildschirmschoner-Timeout und DPMS. Beides ruht, solange ein
- * Client es per MIT-SCREEN-SAVER "Suspend" verlangt, und lebt wieder auf,
- * wenn dessen Verbindung endet - dasselbe Muster wie beim logind-fd.
- * Auch das ohne Bibliothek: Verbindungsaufbau und eine Handvoll Requests,
- * alles little-endian.
+ * Without a desktop service (i3, dwm, bspwm, Openbox ...) it is the X server
+ * itself that blanks the screen: screen saver timeout and DPMS. Both stay off
+ * for as long as some client demands it with the MIT-SCREEN-SAVER request
+ * "Suspend", and resume when that client's connection ends - the same pattern
+ * as the logind fd. This, too, without a library: connection setup and a
+ * handful of requests, all little-endian.
+ *
+ * X11 in brief: a request starts with its opcode, one data byte (for an
+ * extension: the minor opcode) and its length in 4-byte units. The server
+ * numbers the requests of a connection in the order they arrive. What it sends
+ * comes in 32-byte packets - an error (first byte 0), a reply (1, possibly
+ * followed by extra data) or an event - and errors and replies carry the low
+ * 16 bits of the number of the request they belong to.
  */
 
 #define X_COOKIE "MIT-MAGIC-COOKIE-1"
 
+/* State of an X connection while x11_setup() talks to the server */
 struct xconn {
 	int fd;
-	long long deadline;
-	unsigned seq;			/* Nummer des letzten Requests */
-	unsigned watch;			/* Request ohne Antwort, dessen Fehler interessiert */
-	bool failed;			/* ... ist eingetroffen */
+	long long deadline;		/* for the setup as a whole */
+	unsigned seq;			/* number of the last request sent */
+	unsigned watch;			/* a request without reply whose error matters */
+	bool failed;			/* ... and that error has arrived */
 };
 
-/* Feld einer Xauthority-Datei: Laenge (2 Bytes, big-endian), dann die Daten */
+/*
+ * One field of an Xauthority file: length (2 bytes, big-endian), then the data.
+ * A field longer than max is skipped and reported as *len = SIZE_MAX, which
+ * matches nothing. false = end of file or read error.
+ */
 static bool xau_field(FILE *f, unsigned char *buf, size_t max, size_t *len)
 {
 	int hi = getc(f), lo = getc(f);
@@ -1220,7 +1432,7 @@ static bool xau_field(FILE *f, unsigned char *buf, size_t max, size_t *len)
 		return false;
 	*len = (size_t)hi << 8 | (size_t)lo;
 	if (*len > max) {
-		/* passt nicht: ueberlesen, der Eintrag zaehlt als "kein Treffer" */
+		/* does not fit: skip it, the entry then counts as "no match" */
 		if (fseek(f, (long)*len, SEEK_CUR) < 0)
 			return false;
 		*len = SIZE_MAX;
@@ -1229,7 +1441,12 @@ static bool xau_field(FILE *f, unsigned char *buf, size_t max, size_t *len)
 	return fread(buf, 1, *len, f) == *len;
 }
 
-/* Cookie fuer Display num aus $XAUTHORITY bzw. ~/.Xauthority; Laenge oder 0 */
+/*
+ * Look up the MIT-MAGIC-COOKIE-1 for display num in $XAUTHORITY or
+ * ~/.Xauthority; returns its length, or 0 if there is none. An entry is a
+ * 2-byte family followed by four fields: address, display number, name of the
+ * authorization scheme, and its data (the cookie).
+ */
 static size_t x11_cookie(const char *num, unsigned char *cookie, size_t max)
 {
 	const char *file = getenv("XAUTHORITY"), *home = getenv("HOME");
@@ -1255,7 +1472,7 @@ static size_t x11_cookie(const char *num, unsigned char *cookie, size_t max)
 		    !xau_field(f, addr, sizeof addr, &alen) || !xau_field(f, number, sizeof number, &nlen) ||
 		    !xau_field(f, name, sizeof name, &tlen) || !xau_field(f, cookie, max, &clen))
 			break;
-		/* Eintrag fuer diesen Rechner (256 = lokal) oder jeden (65535), dieses Display oder jedes */
+		/* entry for this host (256 = local) or any (65535), for this display or any */
 		if (tlen == strlen(X_COOKIE) && !memcmp(name, X_COOKIE, tlen) && clen > 0 && clen <= max &&
 		    (family == 65535 || (family == 256 && alen == strlen(host) && !memcmp(addr, host, alen))) &&
 		    (nlen == 0 || (nlen == strlen(num) && !memcmp(number, num, nlen)))) {
@@ -1267,6 +1484,7 @@ static size_t x11_cookie(const char *num, unsigned char *cookie, size_t max)
 	return found;
 }
 
+/* Send one request and count it */
 static bool x11_send(struct xconn *x, const void *req, size_t len)
 {
 	x->seq++;
@@ -1274,21 +1492,21 @@ static bool x11_send(struct xconn *x, const void *req, size_t len)
 }
 
 /*
- * Pakete lesen bis zur Reaktion auf den letzten Request: 1 = Antwort (in
- * pkt), 0 = Fehler, -1 = Verbindung weg oder Timeout. Nebenbei wird
- * vermerkt, ob ein Fehler zum Request x->watch eintrifft.
+ * Read packets until the server reacts to the last request: 1 = reply (in
+ * pkt), 0 = error, -1 = connection lost or timeout. Along the way, note
+ * whether an error for request x->watch comes in.
  */
 static int x11_wait(struct xconn *x, unsigned char pkt[32])
 {
 	for (;;) {
-		/* die Frist gilt auch, wenn der Server laufend Ereignisse schickt */
+		/* the deadline also holds while the server keeps sending events */
 		if (now_ms() >= x->deadline || !recv_all(x->fd, pkt, 32, x->deadline))
 			return -1;
 
 		unsigned type = pkt[0], seq = pkt[2] | (unsigned)pkt[3] << 8;
 
 		if (type == 1 || (type & 0x7F) == 35) {
-			/* Antwort oder GenericEvent: Zusatzdaten in 4-Byte-Einheiten */
+			/* reply or GenericEvent: extra data follows, counted in 4-byte units */
 			uint32_t extra = rd32(pkt + 4, false);
 
 			if (extra > 65536 || !recv_all(x->fd, NULL, (size_t)extra * 4, x->deadline))
@@ -1301,7 +1519,7 @@ static int x11_wait(struct xconn *x, unsigned char pkt[32])
 	}
 }
 
-/* Opcode einer Erweiterung; 0, wenn der Server sie nicht hat */
+/* Major opcode of an extension; 0 if the server does not have it */
 static unsigned x11_extension(struct xconn *x, const char *name)
 {
 	unsigned char req[8 + 32] = { 98 /* QueryExtension */ }, pkt[32];
@@ -1316,27 +1534,28 @@ static unsigned x11_extension(struct xconn *x, const char *name)
 }
 
 /*
- * Auf der frischen Verbindung fd anmelden (Cookie fuer Display num) und
- * Bildschirmschoner samt DPMS aussetzen; wake (-u): vorher wie bei einer
- * Eingabe den Bildschirm wecken.
+ * Log in on the fresh connection fd (with the cookie for display num) and
+ * suspend the screen saver together with DPMS. wake (-u): also wake the screen,
+ * as user input would.
  */
 static bool x11_setup(int fd, const char *num, bool wake)
 {
 	static const unsigned char reset[4] = { 115 /* ForceScreenSaver */, 0 /* Reset */, 1 };
 	static const unsigned char sync[4] = { 43 /* GetInputFocus */, 0, 1 };
 	struct xconn x = { .fd = fd, .deadline = now_ms() + CALL_TIMEOUT_MS };
-	unsigned char setup[12 + 20 + 64] = { 'l', 0, 11 /* Protokoll 11.0 */ }, cookie[64], pkt[32];
+	unsigned char setup[12 + 20 + 64] = { 'l', 0, 11 /* protocol 11.0 */ }, cookie[64], pkt[32];
 	size_t clen = x11_cookie(num, cookie, sizeof cookie), nlen = clen ? strlen(X_COOKIE) : 0, len = 12;
 	unsigned saver, dpms;
 
-	/* ohne Cookie entscheidet die Zugriffsliste des Servers */
+	/* without a cookie the server's access control list decides */
 	setup[6] = (unsigned char)nlen;
 	setup[8] = (unsigned char)clen;
 	memcpy(setup + len, X_COOKIE, nlen);
 	len += (nlen + 3) & ~(size_t)3;
 	memcpy(setup + len, cookie, clen);
 	len += (clen + 3) & ~(size_t)3;
-	/* Antwort: Status, dann Zusatzdaten in 4-Byte-Einheiten (bei Erfolg die Beschreibung des Servers) */
+	/* answer: status, then extra data in 4-byte units (on success the server's
+	 * description of itself) */
 	if (!send_all(fd, setup, len, x.deadline) || !recv_all(fd, pkt, 8, x.deadline) ||
 	    !recv_all(fd, NULL, (size_t)(pkt[6] | pkt[7] << 8) * 4, x.deadline) || pkt[0] != 1) {
 		DBG("X11: Display :%s antwortet nicht oder lehnt die Verbindung ab", num);
@@ -1359,7 +1578,8 @@ static bool x11_setup(int fd, const char *num, bool wake)
 
 		x11_send(&x, on, sizeof on);
 	}
-	/* Suspend hat keine Antwort: abwarten, bis der Server einen Request mit Antwort erledigt hat */
+	/* Suspend has no reply: wait until the server has processed a request that
+	 * has one. An error for Suspend would arrive before that reply. */
 	if (!x11_send(&x, sync, sizeof sync) || x11_wait(&x, pkt) != 1 || x.failed) {
 		DBG("X11: Bildschirmschoner laesst sich nicht aussetzen");
 		return false;
@@ -1368,7 +1588,10 @@ static bool x11_setup(int fd, const char *num, bool wake)
 	return true;
 }
 
-/* Liefert den fd, dessen Verbindung Bildschirmschoner und DPMS aussetzt, oder -1 */
+/*
+ * Returns the fd of a connection that keeps screen saver and DPMS suspended
+ * for as long as it stays open, or -1.
+ */
 static int x11_suspend(bool wake)
 {
 	const char *dpy = getenv("DISPLAY"), *wayland = getenv("WAYLAND_DISPLAY");
@@ -1376,17 +1599,17 @@ static int x11_suspend(bool wake)
 	size_t n;
 	int fd;
 
-	/* Unter Wayland waere das Xwayland: Dessen Bildschirmschoner schaltet
-	 * nichts ab, und die Verbindung wuerde es womoeglich erst starten. */
+	/* Under Wayland this would be Xwayland: its screen saver blanks nothing,
+	 * and the connection might be what starts it in the first place. */
 	if (!dpy || (wayland && *wayland))
 		return -1;
-	/* nur lokale Displays ":N" und ":N.S"; bei ssh -X stuende der Bildschirm woanders */
+	/* local displays ":N" and ":N.S" only; with ssh -X the screen would be elsewhere */
 	if (!strncmp(dpy, "unix", 4))
 		dpy += 4;
 	n = *dpy == ':' ? strspn(dpy + 1, "0123456789") : 0;
 	if (n == 0 || (dpy[1 + n] != '\0' && dpy[1 + n] != '.'))
 		return -1;
-	/* ":007" meint Display 7 */
+	/* ":007" means display 7 */
 	for (dpy++; n > 1 && *dpy == '0'; dpy++)
 		n--;
 	if (n >= sizeof num)
@@ -1406,9 +1629,9 @@ static int x11_suspend(bool wake)
 }
 
 /*
- * Was der X-Server ungefragt schickt, verwerfen (MappingNotify etwa bekommt
- * jeder Client), damit sich bei ihm nichts staut. Ist der Server weg, die
- * Verbindung schliessen.
+ * Discard whatever the X server sends unasked (every client gets MappingNotify,
+ * for example), so that nothing piles up on its side. If the server is gone,
+ * close the connection.
  */
 static void x11_drain(struct assertion *a)
 {
@@ -1416,7 +1639,7 @@ static void x11_drain(struct assertion *a)
 	size_t total = 0;
 	ssize_t n = 1;
 
-	/* in Portionen, damit die Hauptschleife auch bei einer Flut drankommt */
+	/* in portions, so that the main loop gets its turn even during a flood */
 	for (int i = 0; i < 64 && (n = recv(a->xfd, junk, sizeof junk, MSG_DONTWAIT)) > 0; i++)
 		total += (size_t)n;
 	if (total)
@@ -1434,8 +1657,9 @@ static void x11_drain(struct assertion *a)
 	}
 }
 
-/* ---------------------------------------------------------------- Netzteil */
+/* ---------------------------------------------------------------- Power supply */
 
+/* First line of /sys/class/power_supply/<dev>/<attr>, without the newline */
 static bool read_sysfs(const char *dev, const char *attr, char *buf, size_t len)
 {
 	char path[PATH_MAX];
@@ -1453,7 +1677,10 @@ static bool read_sysfs(const char *dev, const char *attr, char *buf, size_t len)
 	return ok;
 }
 
-/* USB-C: Speist der Port gerade ein Geraet (Rolle "source"), ist er fuer uns keine Stromquelle */
+/*
+ * USB-C: a port that is currently powering a device (role "source") is not a
+ * power source for us.
+ */
 static bool usb_is_source(const char *dev)
 {
 	char path[PATH_MAX], buf[64];
@@ -1471,7 +1698,7 @@ static bool usb_is_source(const char *dev)
 		snprintf(path, sizeof path, "%s/device/typec/%s", dev, e->d_name);
 		if (!read_sysfs(path, "power_role", buf, sizeof buf))
 			continue;
-		/* die aktive Rolle steht in Klammern: "[source] sink" */
+		/* the active role is the one in brackets: "[source] sink" */
 		if (strstr(buf, "[source]"))
 			source = true;
 		else if (strstr(buf, "[sink]"))
@@ -1482,11 +1709,11 @@ static bool usb_is_source(const char *dev)
 }
 
 /*
- * Wie on_ac_power() von systemd: am Netz, sobald eine Stromquelle online
- * meldet; sonst nur dann nicht, wenn ein Akku entlaedt. Ein Rechner ohne
- * Akku (Desktop) gilt also als "am Netz", auch wenn ein USB-C-Port als
- * Stromquelle offline meldet. Akkus von Peripherie (Maus, Tastatur) und
- * nicht eingesetzte zaehlen nicht.
+ * The rules of systemd's on_ac_power(): on mains as soon as one power source
+ * reports online; otherwise off mains only if a battery is discharging. A
+ * machine without battery (desktop) therefore counts as "on mains" even when a
+ * USB-C port reports offline as a power source. Batteries of peripherals
+ * (mouse, keyboard) and empty battery bays do not count.
  */
 static bool on_ac_power(void)
 {
@@ -1505,19 +1732,23 @@ static bool on_ac_power(void)
 				continue;
 			if (read_sysfs(e->d_name, "present", buf, sizeof buf) && !strcmp(buf, "0"))
 				continue;
-			/* ohne lesbaren Status wie systemd: vorsichtshalber "entlaedt" */
+			/* no readable status: like systemd, assume "discharging" to be safe */
 			if (!read_sysfs(e->d_name, "status", buf, sizeof buf) || !strcmp(buf, "Discharging"))
 				discharging = true;
 		} else if (!(strncmp(buf, "USB", 3) == 0 && usb_is_source(e->d_name)) &&
 		           read_sysfs(e->d_name, "online", buf, sizeof buf) && strtoul(buf, NULL, 10) > 0) {
-			online = true;	/* 1 = fest, 2 = programmierbar (USB-PD) */
+			online = true;	/* 1 = fixed, 2 = programmable (USB PD) */
 		}
 	}
 	closedir(d);
 	return online || !discharging;
 }
 
-/* -s: Sperre nur am Netzteil halten; false, wenn sie sich dort nicht anlegen laesst */
+/*
+ * -s: hold the "sleep" lock only while on mains power, as Apple does. The main
+ * loop calls this every AC_POLL_MS. false = on mains, but the lock could not be
+ * taken.
+ */
 static bool update_system_assertion(void)
 {
 	struct assertion *a = &as[A_SYSTEM];
@@ -1535,15 +1766,45 @@ static bool update_system_assertion(void)
 	return a->fd >= 0;
 }
 
-/* ---------------------------------------------------------------- anlegen/freigeben */
+/* ---------------------------------------------------------------- Acquire and release */
 
+/*
+ * How an assertion is enforced, and how that is kept true over time:
+ *
+ *   create_one()          First choice is a desktop service on the session
+ *                         bus (a->be, a->cookie), else the logind "idle"
+ *                         inhibitor (a->fd). -d and -u additionally suspend
+ *                         the X screen saver (a->xfd). -s only ever uses
+ *                         the logind "sleep" inhibitor.
+ *
+ *   name_changed()        A backend service stopped, restarted or appeared:
+ *                         mark the affected assertions stale and schedule
+ *                         refresh_assertions() through refresh_at.
+ *
+ *   refresh_assertions()  Re-acquire the stale ones: from the same service
+ *                         once it is back, from a better one that appeared,
+ *                         or from the fallback. An old lock is only dropped
+ *                         after the new one is held, so there is no gap.
+ *
+ * After a service restart the first attempt follows SETTLE_MS later. If no
+ * desktop service took the lock, there is one follow-up RETRY_MS after that.
+ * An assertion that then has no lock at all is reported on stderr and retried
+ * every LOST_RETRY_MS until it is back.
+ */
+
+/* The desktop services that can enforce an assertion type; NULL for -s and -m */
 static const struct backend *backends_for(int type)
 {
 	return type == A_IDLE ? system_backends :
 	       type == A_DISPLAY || type == A_USER ? display_backends : NULL;
 }
 
-/* first = false: Sperre nach einem Dienst-Neustart erneut anlegen */
+/*
+ * Acquire whatever enforces assertion type on this system (see above).
+ * first = false: re-acquire after a service restart; the screen is not woken
+ * again, and the X connection, which outlives such restarts, is kept. Returns
+ * false if nothing could be acquired; "reason" then says why.
+ */
 static bool create_one(int type, bool first)
 {
 	struct assertion *a = &as[type];
@@ -1557,7 +1818,7 @@ static bool create_one(int type, bool first)
 			simulate_user_activity();
 		/* fall through */
 	case A_DISPLAY:
-		/* die X11-Verbindung ueberdauert einen Neustart der Desktop-Dienste */
+		/* the X11 connection outlives a restart of the desktop services */
 		if (first)
 			a->xfd = x11_suspend(type == A_USER);
 		/* fall through */
@@ -1567,19 +1828,21 @@ static bool create_one(int type, bool first)
 		a->fd = logind_inhibit("idle");
 		return a->fd >= 0 || a->xfd >= 0;
 	case A_SYSTEM:
-		/* Akkubetrieb: Assertion gilt, wirkt aber erst am Netzteil */
+		/* on battery the assertion is accepted, but only takes effect on mains */
 		if (!get_sys_bus()) {
 			fail("System-Bus nicht erreichbar");
 			return false;
 		}
 		return update_system_assertion();
 	case A_DISK:
+		/* no counterpart on Linux: accepted, nothing to do */
 		return true;
 	default:
 		return false;
 	}
 }
 
+/* Release one assertion: close its fds and hand its cookie back */
 static void release_one(int type)
 {
 	struct assertion *a = &as[type];
@@ -1596,6 +1859,7 @@ static void release_one(int type)
 	DBG("%s freigegeben", type_name[type]);
 }
 
+/* Release everything and disconnect from both buses */
 static void release_all(void)
 {
 	for (int i = 0; i < A_COUNT; i++)
@@ -1604,16 +1868,19 @@ static void release_all(void)
 	bus_kill(&sys_bus);
 }
 
-/* wie createAssertions() bei Apple; false = Fehler, Aufrufer beendet mit 1 */
+/*
+ * Like createAssertions() in Apple's source: create the requested assertions in
+ * type order. false = failure; the caller then exits with status 1.
+ */
 static bool create_assertions(const bool want[A_COUNT], long timeout)
 {
 	for (int i = 0; i < A_COUNT; i++) {
 		if (!want[i])
 			continue;
 		if (i == A_USER && timeout == 0)
-			timeout = 5;	/* gilt bei Apple auch fuer alle folgenden */
+			timeout = 5;	/* as with Apple, this then applies to all later ones too */
 		if (!create_one(i, true)) {
-			/* halb angelegte Sperre (z. B. -s) trotzdem sauber freigeben */
+			/* mark it active so a half-created lock (e.g. -s) is released cleanly */
 			as[i].active = true;
 			if (*reason && !debug)
 				fprintf(stderr, NAME ": %s\n", reason);
@@ -1628,10 +1895,14 @@ static bool create_assertions(const bool want[A_COUNT], long timeout)
 }
 
 /*
- * Der Besitzer eines Dienstnamens hat gewechselt: Der Dienst ist beendet
- * (new_owner leer) oder (neu) gestartet. Eine Sperre bei ihm ist damit weg.
- * Kommt ein Dienst, der in der Liste vor dem jetzigen steht - oder
- * ueberhaupt einer, solange nur die Ersatzsperre haelt -, wird gewechselt.
+ * The owner of a service name has changed: the service exited (new_owner is
+ * empty) or was (re)started. A lock held there is gone with it. If a service
+ * appears that precedes the current one in the list - or any service at all
+ * while only the fallback lock holds - the assertion moves over to it.
+ *
+ * This runs in the middle of call() or sess_dispatch(). It therefore only
+ * records what happened and schedules refresh_assertions(); it never makes a
+ * call itself.
  */
 static void name_changed(const char *name, const char *new_owner)
 {
@@ -1646,11 +1917,13 @@ static void name_changed(const char *name, const char *new_owner)
 		if (!a->active || !be)
 			continue;
 		if (a->be && !strcmp(a->be->dest, name)) {
-			/* das Cookie gehoert dem alten Besitzer; beim neuen koennte
-			 * dieselbe Nummer die Sperre eines anderen Programms sein */
+			/* the cookie belonged to the old owner; with the new one the
+			 * same number could be the lock of another program */
 			a->be = NULL;
 			owner_changes++;
 		} else {
+			/* otherwise this only matters if the service came up and ranks
+			 * before the one currently used */
 			while (be->dest && be != a->be && strcmp(be->dest, name) != 0)
 				be++;
 			if (!*new_owner || !be->dest || be == a->be)
@@ -1663,14 +1936,18 @@ static void name_changed(const char *name, const char *new_owner)
 	}
 }
 
-/* Aufrufer hat refresh_at zurueckgesetzt; kommt waehrenddessen ein Signal, plant name_changed() neu */
+/*
+ * Bring every stale assertion back in line with what the system offers now (see
+ * the overview above). The caller has reset refresh_at; if a signal arrives
+ * while this runs, name_changed() schedules the next round.
+ */
 static void refresh_assertions(void)
 {
 	bool follow_up = retry, again = false, lost = false;
 
 	retry = false;
 	for (int i = 0; i < A_COUNT; i++) {
-		/* fehlt eine Sperre ganz, duerfen es auch abgerissene Busverbindungen noch einmal versuchen */
+		/* with no lock at all, even broken bus connections get another try */
 		if (as[i].active && as[i].lost) {
 			if (user_bus.fd < 0)
 				user_bus.tried = false;
@@ -1685,9 +1962,9 @@ static void refresh_assertions(void)
 			continue;
 		a->stale = false;
 		if (old.be) {
-			/* Ein Dienst weiter vorn in der Liste ist gekommen: erst dort
-			 * sperren, dann die bisherige Sperre aufgeben - es sei denn, deren
-			 * Dienst hat inzwischen gewechselt, dann gibt es sie nicht mehr. */
+			/* A service further up the list has appeared: lock there first, then
+			 * give up the previous lock - unless its service has changed owner in
+			 * the meantime, in which case that lock no longer exists. */
 			unsigned before = owner_changes;
 
 			if (sess_inhibit(backends_for(i), old.be, a) && before == owner_changes)
@@ -1696,18 +1973,18 @@ static void refresh_assertions(void)
 		}
 		create_one(i, false);
 		if (a->be || a->fd >= 0) {
-			/* Ersatzsperre erst jetzt freigeben, damit keine Luecke entsteht */
+			/* release the old fallback lock only now, so that there is no gap */
 			if (old.fd >= 0)
 				close(old.fd);
 			if (a->lost)
 				fprintf(stderr, NAME ": %s: Sperre wieder angelegt\n", type_name[i]);
 			a->lost = false;
 		} else {
-			/* nichts Neues bekommen: die alte Ersatzsperre gilt weiter */
+			/* got nothing new: the old fallback lock stays in force */
 			a->fd = old.fd;
 			if (old.fd < 0 && a->xfd < 0) {
-				/* ganz ohne Sperre: melden, sobald auch das Nachfassen nichts
-				 * gebracht hat, und es in groesseren Abstaenden weiter versuchen */
+				/* no lock at all: report it once the follow-up has failed as
+				 * well, and keep trying at longer intervals */
 				if (!follow_up && !a->lost) {
 					fprintf(stderr, NAME ": %s: Sperre verloren%s%s\n", type_name[i],
 					        *reason ? ": " : "", reason);
@@ -1716,6 +1993,7 @@ static void refresh_assertions(void)
 				a->stale = lost = true;
 			}
 		}
+		/* no desktop service yet - it may still be starting: look once more */
 		if (!a->be && follow_up)
 			a->stale = again = true;
 	}
@@ -1723,7 +2001,10 @@ static void refresh_assertions(void)
 		refresh_at = now_ms() + (again ? RETRY_MS : LOST_RETRY_MS);
 }
 
-/* Der Session-Bus ist weg (abgemeldet): Die Sperren dort gibt es nicht mehr */
+/*
+ * The session bus is gone (logout): the locks held there no longer exist.
+ * Refresh at once, which now leads to the logind fallback.
+ */
 static void sess_gone(void)
 {
 	for (int i = 0; i < A_COUNT; i++) {
@@ -1736,20 +2017,20 @@ static void sess_gone(void)
 	}
 }
 
-/* Eingegangenes vom Session-Bus abarbeiten, ohne zu warten */
+/* Process what has arrived on the session bus, without waiting */
 static void sess_dispatch(void)
 {
 	struct message m;
 	int r = 0;
 
-	/* in Portionen: Signale und Fristen der Hauptschleife kommen auch bei einer Flut dran */
+	/* in portions: signals and deadlines of the main loop get their turn even during a flood */
 	for (int n = 0; n < 32 && (r = bus_next(&user_bus, 0, &m)) > 0; n++)
 		bus_other(&user_bus, &m);
 	if (r < 0)
 		sess_gone();
 }
 
-/* -w ohne pidfd: Gibt es den Prozess noch? Ein Zombie zaehlt als beendet. */
+/* -w without pidfd: does the process still exist? A zombie counts as gone. */
 static bool pid_alive(pid_t pid)
 {
 	char path[64], buf[512];
@@ -1766,15 +2047,16 @@ static bool pid_alive(pid_t pid)
 	n = fread(buf, 1, sizeof buf - 1, f);
 	fclose(f);
 	buf[n] = '\0';
-	/* "PID (Name) Zustand ..."; der Name kann selbst Klammern enthalten */
+	/* "pid (name) state ..."; the name may itself contain parentheses */
 	end = strrchr(buf, ')');
 	return !(end && end[1] == ' ' && (end[2] == 'Z' || end[2] == 'X'));
 }
 
 /*
- * Signal ueber das signalfd abholen - es sei denn, es wird ignoriert (nohup,
- * Hintergrundjob einer Shell ohne Jobkontrolle). Blockiert kaeme es dort
- * trotzdem an, und caffeinate endete, obwohl das command weiterlaeuft.
+ * Have the signal delivered through the signalfd - unless it is being ignored
+ * (nohup, background job of a shell without job control). Blocked, it would
+ * arrive there all the same, and caffeinate would exit although the command
+ * keeps running.
  */
 static void watch_signal(sigset_t *mask, int sig)
 {
@@ -1786,6 +2068,11 @@ static void watch_signal(sigset_t *mask, int sig)
 
 /* ---------------------------------------------------------------- main */
 
+/*
+ * End the way a process killed by sig ends, so that the parent sees the true
+ * cause: restore the default action, unblock the signal and raise it again.
+ * Returns the shell's exit status for that signal in case this does not kill.
+ */
 static int die_by_signal(int sig, const sigset_t *oldmask)
 {
 	sigset_t one;
@@ -1799,6 +2086,13 @@ static int die_by_signal(int sig, const sigset_t *oldmask)
 	return 128 + sig;
 }
 
+/*
+ * 1. parse the options the way Apple's getopt loop does
+ * 2. with a command: fork; the parent becomes the command, the child goes on
+ * 3. create the assertions
+ * 4. event loop, until a timeout, a signal or the end of the watched process
+ * 5. release everything
+ */
 int main(int argc, char **argv)
 {
 	bool want[A_COUNT] = { false };
@@ -1810,8 +2104,9 @@ int main(int argc, char **argv)
 	for (int i = 0; i < A_COUNT; i++)
 		as[i].fd = as[i].xfd = -1;
 
-	/* '+': wie BSD-getopt beim ersten Nicht-Flag aufhoeren; ':' + opterr = 0:
-	 * Meldungen im BSD-Wortlaut statt glibc/musl */
+	/* '+': stop at the first non-option like BSD getopt, which leaves the
+	 * command's own flags alone; ':' and opterr = 0: print the messages in BSD
+	 * wording instead of glibc's or musl's */
 	opterr = 0;
 	while ((ch = getopt(argc, argv, "+:mdhisut:w:")) != -1) {
 		switch (ch) {
@@ -1833,7 +2128,7 @@ int main(int argc, char **argv)
 				usage();
 				return EXIT_FAILURE;
 			}
-			if (timeout < 0)	/* bei Apple unsigned: praktisch unendlich */
+			if (timeout < 0)	/* unsigned in Apple's code: practically infinite */
 				timeout = LONG_MAX;
 			break;
 		case ':':
@@ -1847,38 +2142,38 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* no assertion flag at all: -i is the default */
 	bool any = false;
 	for (int i = 0; i < A_COUNT; i++)
 		any |= want[i];
 	if (!any)
 		want[A_IDLE] = true;
 
+	/* the signals that end caffeinate are read from a signalfd in the event loop */
 	sigset_t mask, oldmask;
 	sigemptyset(&mask);
 	watch_signal(&mask, SIGTERM);
 	watch_signal(&mask, SIGHUP);
 
-	int pfd = -1;		/* Prozess, auf dessen Ende gewartet wird */
-	int death_sig = 0;	/* mit command ohne pidfd: Signal beim Tod des Elternprozesses */
-	pid_t pid_poll = 0;	/* -w ohne pidfd: per kill(pid, 0) abfragen */
-	long long deadline = FOREVER;
+	int pfd = -1;		/* pidfd of the process whose end is awaited */
+	int death_sig = 0;	/* command without pidfd: signal sent when the parent dies */
+	pid_t pid_poll = 0;	/* -w without pidfd: pid to check with kill(pid, 0) */
+	long long deadline = FOREVER;	/* when caffeinate itself ends (-t without command) */
 	bool have_cmd = argc - optind > 0;
 
 	if (have_cmd) {
-		/*
-		 * Wie Apple: frueh forken, der Elternprozess wird per exec zum
-		 * command (PID, Exit-Status und Signale bleiben dessen eigene),
-		 * das Kind haelt die Assertions und wacht ueber den Elternprozess.
-		 */
+		/* Like Apple: fork early. The parent exec()s the command, so PID,
+		 * exit status and signals remain the command's own; the child
+		 * holds the assertions and watches over the parent. */
 		argv += optind;
 		pid_t parent = getpid();
-		int self_fd = sys_pidfd_open(parent);	/* von Haus aus CLOEXEC */
+		int self_fd = sys_pidfd_open(parent);	/* CLOEXEC by default */
 
 		switch (fork()) {
 		case 0:
 			break;
 		case -1:
-			/* kein Hilfsprozess, also keine Sperren - das command laeuft trotzdem */
+			/* no helper process, hence no locks - the command runs all the same */
 			perror(NAME ": fork");
 			/* fall through */
 		default:
@@ -1888,23 +2183,28 @@ int main(int argc, char **argv)
 			_exit(saved_errno == ENOENT ? 127 : 126);
 		}
 
+		/* child: keep only the pidfd; SIGINT and SIGQUIT from the terminal are
+		 * meant for the command */
 		pfd = close_inherited_fds(self_fd);
 		signal(SIGINT, SIG_IGN);
 		signal(SIGQUIT, SIG_IGN);
 		if (pfd < 0) {
-			/* kein pidfd (Kernel < 5.3): Signal beim Tod des Elternprozesses.
-			 * Ein eigenes, denn SIGTERM kann ignoriert sein (nohup, trap). */
+			/* no pidfd (kernel < 5.3): let the kernel signal us when the parent
+			 * dies. With a signal of our own, since SIGTERM may be ignored
+			 * (nohup, trap). */
 			death_sig = SIGUSR1;
 			sigaddset(&mask, death_sig);
 		}
 		sigprocmask(SIG_BLOCK, &mask, &oldmask);
 		if (death_sig)
 			prctl(PR_SET_PDEATHSIG, death_sig);
+		/* the parent was gone before we could start watching it */
 		if (getppid() != parent)
 			return EXIT_SUCCESS;
 		snprintf(details, sizeof details,
 		         "caffeinate asserting on behalf of '%s' (pid %d)", *argv, (int)parent);
 	} else {
+		/* no command: SIGINT and SIGQUIT from the terminal end caffeinate itself */
 		watch_signal(&mask, SIGINT);
 		watch_signal(&mask, SIGQUIT);
 		sigprocmask(SIG_BLOCK, &mask, &oldmask);
@@ -1921,8 +2221,8 @@ int main(int argc, char **argv)
 				pfd = sys_pidfd_open((pid_t)waitforpid);
 			if (pfd < 0) {
 				if (waitforpid < 0 || errno == ESRCH || errno == EINVAL)
-					deadline = 0;	/* gibt es nicht: libdispatch meldet sofort Exit */
-				else	/* kein pidfd (Kernel < 5.3, seccomp): abfragen */
+					deadline = 0;	/* no such process: exit at once, like Apple */
+				else	/* no pidfd (kernel < 5.3, seccomp): check periodically */
 					pid_poll = (pid_t)waitforpid;
 			}
 		} else if (timeout) {
@@ -1938,6 +2238,7 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
+	/* details[] travels over D-Bus and has to be valid UTF-8 */
 	utf8_sanitize(details);
 	if (!create_assertions(want, timeout)) {
 		release_all();
@@ -1946,6 +2247,9 @@ int main(int argc, char **argv)
 
 	int exit_code = EXIT_SUCCESS, term_sig = 0;
 
+	/* Event loop. Each round: handle bus traffic, run a refresh that is due,
+	 * expire assertions, do the periodic checks, then sleep in poll() until
+	 * the earliest deadline or until one of the fds has something. */
 	for (;;) {
 		if (user_bus.fd >= 0)
 			sess_dispatch();
@@ -1979,17 +2283,18 @@ int main(int argc, char **argv)
 			if (next == FOREVER || now + PID_POLL_MS < next)
 				next = now + PID_POLL_MS;
 		}
-		/* der Session-Bus kann in jedem der Aufrufe oben gestorben sein */
+		/* the session bus may have died in any of the calls above */
 		if (user_bus.fd < 0)
 			sess_gone();
 		if (refresh_at != FOREVER && (next == FOREVER || refresh_at < next))
 			next = refresh_at;
 
+		/* poll set: signalfd, pidfd if there is one, session bus, X connections */
 		long long wait = next == FOREVER ? -1 : next < now ? 0 : next - now;
 		struct pollfd p[3 + A_COUNT] = { { sfd, POLLIN, 0 }, { pfd, POLLIN, 0 } };
 		nfds_t n = pfd >= 0 ? 2 : 1, first_x;
 
-		/* Session-Bus: weckt nur, gelesen wird oben */
+		/* session bus: this only wakes us; reading happens at the top of the loop */
 		if (user_bus.fd >= 0)
 			p[n++] = (struct pollfd){ user_bus.fd, POLLIN, 0 };
 		first_x = n;
@@ -2004,6 +2309,7 @@ int main(int argc, char **argv)
 			exit_code = EXIT_FAILURE;
 			break;
 		}
+		/* a signal: leave the loop; death_sig only says that the parent is gone */
 		if (p[0].revents & POLLIN) {
 			struct signalfd_siginfo si;
 			if (read(sfd, &si, sizeof si) == sizeof si) {
@@ -2012,6 +2318,7 @@ int main(int argc, char **argv)
 				break;
 			}
 		}
+		/* the watched process (-w, or the command) has ended */
 		if (pfd >= 0 && (p[1].revents & (POLLIN | POLLHUP | POLLERR)))
 			break;
 		for (int i = 0; i < A_COUNT; i++)
@@ -2023,6 +2330,7 @@ int main(int argc, char **argv)
 	if (pfd >= 0)
 		close(pfd);
 	close(sfd);
+	/* everything is released: now end through the signal that stopped us */
 	if (term_sig)
 		exit_code = die_by_signal(term_sig, &oldmask);
 	return exit_code;

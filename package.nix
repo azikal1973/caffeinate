@@ -1,4 +1,4 @@
-# Paketbeschreibung fuer Nix/NixOS. Mit Flakes siehe flake.nix, ohne:
+# Package definition for Nix/NixOS. With flakes see flake.nix; without:
 #   nix-build -E 'with import <nixpkgs> { }; callPackage ./package.nix { }'
 { lib, stdenv }:
 
@@ -6,7 +6,7 @@ stdenv.mkDerivation {
   pname = "caffeinate";
   version = "0.2.0.0";
 
-  # nur die Quellen, kein evtl. schon gebautes Binary aus dem Arbeitsverzeichnis
+  # only the sources, not a binary that may already sit in the working directory
   src = lib.fileset.toSource {
     root = ./.;
     fileset = lib.fileset.unions [
@@ -19,7 +19,7 @@ stdenv.mkDerivation {
 
   makeFlags = [ "PREFIX=${placeholder "out"}" ];
 
-  # Der D-Bus-Test braucht dbus-daemon und PyGObject; im Build genuegt der Smoke-Test.
+  # The D-Bus test needs dbus-daemon and PyGObject; for the build the smoke test is enough.
   doCheck = true;
   checkPhase = ''
     runHook preCheck
