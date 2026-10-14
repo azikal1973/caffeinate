@@ -1,13 +1,16 @@
-# caffeinate für Linux
+# caffeinate für Linux und Windows
 
-Version 0.2.0.1
+Version 0.3.0.0
 
 Nachbau von macOS-`caffeinate(8)` in C. Parameter und Verhalten folgen Apples
-Quellcode (PowerManagement/caffeinate), sodass man zwischen Mac und Linux keinen
-Unterschied merkt.
+Quellcode (PowerManagement/caffeinate), sodass man zwischen Mac, Linux und Windows
+keinen Unterschied merkt.
 
-Eine einzelne C-Datei, die außer der libc nichts braucht. Statisch gelinkt läuft
-das Binary auf jeder Distribution, ohne dass etwas installiert werden muss.
+Für Linux eine C-Datei samt kleinem Header (`caffeinate.c`, `caffeinate.h`), die außer der libc
+nichts braucht. Statisch gelinkt
+läuft das Binary auf jeder Distribution, ohne dass etwas installiert werden muss.
+Die Windows-Fassung wird mit zig zu einer einzelnen `.exe` gebaut, siehe
+[Windows](#windows).
 
 ```
 caffeinate [-disu] [-t timeout] [-w Process ID] [command arguments...]
@@ -248,6 +251,151 @@ zuständig ist, und nimmt logind, wenn keiner da ist. Dazu kommen `-t` neben ein
 nur am Netzteil und das Neuanlegen der Sperre, wenn der Dienst neu startet. Skripte laufen unverändert
 auf dem Mac.
 
+## Windows
+
+Windows 10 und 11, x64 und ARM64. Die Optionen sind dieselben, dazu kommt `-r`:
+
+```
+caffeinate [-dirsu] [-t timeout] [-w Process ID] [command arguments...]
+```
+
+```powershell
+caffeinate                     # kein Standby, bis Strg+C
+caffeinate -r                  # dazu kein Neustart durch Windows Update (Terminal als Administrator)
+caffeinate -d -t 3600          # eine Stunde lang bleibt auch der Bildschirm an
+caffeinate npm run build       # solange der Befehl läuft; npm.cmd wird über PATHEXT gefunden
+caffeinate -w 4711             # bis Prozess 4711 endet
+```
+
+Damit Terminals ungestört weiterlaufen, bis man sie selbst beendet, reicht in einem Terminal mit
+Administratorrechten `caffeinate -r`. Der Rechner geht nicht von selbst in den Standby, und
+Windows Update startet ihn nicht neu. Strg+C oder das Schließen des Fensters beenden caffeinate,
+danach gilt alles wieder wie vorher.
+
+### Installieren
+
+Das fertige `caffeinate-x86_64-windows.exe` bzw. `caffeinate-aarch64-windows.exe` aus den Releases
+als `caffeinate.exe` in ein Verzeichnis im `PATH` legen. Es braucht keine DLLs außer denen von
+Windows.
+
+Selbst bauen, auf Windows, Linux oder macOS, mit [zig](https://ziglang.org) (getestet mit
+0.15.2) und GNU make:
+
+```sh
+make windows          # caffeinate-x86_64-windows.exe und caffeinate-aarch64-windows.exe
+make test-windows     # in Git Bash; als Administrator auch Power Requests und -r
+```
+
+Ohne make: `zig cc -target x86_64-windows-gnu -O2 -s -o caffeinate.exe caffeinate_win.c -luser32 -ladvapi32`.
+Jeder andere mingw-w64-gcc oder -clang geht ebenso.
+
+### Umsetzung
+
+| Flag | macOS-Assertion | Windows |
+|---|---|---|
+| `-i` | PreventUserIdleSystemSleep (Standard) | Power Request `SystemRequired` |
+| `-d` | PreventUserIdleDisplaySleep | Power Request `DisplayRequired`: der Bildschirm bleibt an |
+| `-s` | PreventSystemSleep (nur am Netzteil) | `SystemRequired`, nur am Netz (alle 5 s geprüft) |
+| `-u` | UserIsActive (Standard-Timeout 5 s) | eine Mausbewegung um 0 Pixel (setzt die Leerlaufzeit zurück, weckt den Bildschirm), dann wie `-d` |
+| `-m` | PreventDiskIdle | kein Gegenstück, ohne Wirkung |
+| `-r` | – | Windows Update pausieren und Nutzungszeit mitführen, siehe unten |
+
+Die Power Requests zeigt `powercfg /requests` (als Administrator) mit dem Grund, etwa
+`caffeinate asserting forever`. Sie hängen am Prozess und fallen weg, wenn caffeinate endet, auch
+wenn es per Task-Manager beendet wird.
+
+Ohne `-r` braucht caffeinate keine Administratorrechte.
+
+Mit command startet caffeinate den Befehl und wartet auf ihn, denn Windows kennt kein `exec`. Der
+Befehl bekommt den Rest der Befehlszeile unverändert, caffeinate endet mit seinem Exit-Code. Strg+C
+geht an den Befehl, caffeinate selbst ignoriert es. Hat der Befehl keine Konsole (`caffeinate
+notepad`), beendet Strg+C caffeinate, und das Programm läuft ohne Sperre weiter. Ohne command endet
+caffeinate durch Strg+C mit dem Status, den Windows dafür vorsieht (`0xC000013A`).
+
+Den Befehl sucht caffeinate wie PowerShell: ein Name ohne Verzeichnis nur entlang `PATH`, nicht
+zuerst im aktuellen Verzeichnis, wie es cmd.exe täte. Ohne Endung probiert es die aus `PATHEXT`,
+von denen aber nur `.exe`, `.com`, `.bat` und `.cmd`. Was dort nicht liegt, gilt als nicht gefunden
+(Exit 127). Eine Batchdatei startet es mit genau der gefundenen Datei über `cmd.exe /d /s /c`; liegt
+sie in einem Pfad mit `%`, verweigert caffeinate den Start, weil cmd den Pfad sonst verändern würde. cmd liest deren Argumente dabei ein zweites Mal: Wer
+caffeinate aus cmd.exe aufruft und in Argumenten `&`, `|`, `<`, `>` oder `^` mit `^` schützt, muss sie
+doppelt schützen oder in Anführungszeichen setzen. Aus PowerShell und Git Bash gilt dasselbe wie
+beim direkten Aufruf der Batchdatei.
+
+### Windows Update aufhalten (`-r`)
+
+Für Windows Update gibt es keine Sperre, die an einem Prozess hängt. `-r` setzt deshalb zwei
+Einstellungen und behandelt sie wie eine Sperre mit Ablaufzeit:
+
+- **Pause:** dieselbe Pause wie unter Einstellungen › Windows Update, jeweils bis 24 Stunden im
+  Voraus und alle 30 Minuten verlängert. Es wird kein neues Update installiert, also verlangt auch
+  keines einen Neustart. Hat man selbst länger pausiert, bleibt die eigene Pause stehen.
+- **Nutzungszeit:** Ein Update, das schon vor dem Start installiert war, startet den Rechner
+  außerhalb der Nutzungszeit neu. Die Richtlinie dafür (`SetActiveHours`, `ActiveHoursStart`,
+  `ActiveHoursEnd`) legt caffeinate von einer Stunde vor jetzt bis 17 Stunden danach. Mehr als
+  18 Stunden erlaubt Windows nicht. Weil caffeinate das Fenster mitschiebt, ist es nie außerhalb der
+  Nutzungszeit. Solange `-r` läuft, zeigt die Seite Windows Update „Einige Einstellungen werden von
+  Ihrer Organisation verwaltet“.
+
+Bevor caffeinate einen Wert zum ersten Mal ändert, sichert es den alten unter
+`HKLM\SOFTWARE\caffeinate`. Am Ende schreibt es die alten Werte zurück, auch beim Abmelden,
+Herunterfahren oder Neustart, und zwar je Gruppe (Nutzungszeit, Pause): Hat jemand anderes einen
+Wert der Gruppe inzwischen geändert, bleibt die ganze Gruppe so, wie sie ist. Eine solche Änderung
+während des Laufs, etwa „Updates fortsetzen“ in den Einstellungen, bemerkt caffeinate bei der nächsten
+Verlängerung; es meldet sie und lässt die Gruppe ab dann in Ruhe. Nach dem Aufwachen aus dem Standby
+und nach einer Zeitumstellung verlängert caffeinate sofort.
+
+Wird caffeinate gewaltsam beendet, läuft die Pause nach spätestens 24 Stunden aus. Die Richtlinie
+zur Nutzungszeit bleibt dagegen stehen, samt Hinweis auf die Verwaltung durch die Organisation, bis
+zum nächsten `caffeinate -r`: Das stellt die alten Werte wieder her, ein kurzes `caffeinate -r -t 1`
+räumt also auf.
+
+Laufen mehrere `caffeinate -r`, verwaltet nur eines die Einstellungen, die anderen sagen, dass sie
+warten. Endet es, auch gewaltsam, übernimmt ein anderes.
+
+Grenzen:
+
+- Microsoft dokumentiert die Richtlinie zur Nutzungszeit, aber keine Schnittstelle für die Pause.
+  caffeinate schreibt dieselben Werte wie die Einstellungen-App. Ein Windows-Update könnte das
+  ändern.
+- Auf verwalteten Rechnern (Intune, Gruppenrichtlinie mit Fristen für Updates und Neustarts) setzt
+  sich die Frist durch.
+- Nach dem Ende holt Windows Update alles nach und startet außerhalb der Nutzungszeit neu.
+
+### Was caffeinate unter Windows nicht verhindert
+
+- Standby, den man selbst auslöst: Start › Ein/Aus › Energie sparen, den Netzschalter oder das
+  Zuklappen des Laptops. Das gilt ebenso für `-i` auf Linux und dem Mac. Dagegen hilft nur eine Einstellung
+  unter Systemsteuerung › Energieoptionen.
+- Abmelden: Das tut Windows nicht von selbst. Ein gesperrter Bildschirm hält keine Programme an,
+  Terminals laufen dahinter weiter. Mit `-d` bleibt der Bildschirm an, eine Sperre, die beim
+  Ausschalten des Bildschirms kommt, bleibt damit aus. Ob ein Bildschirmschoner mit Anmeldung oder
+  die Richtlinie „Computer: Inaktivitätsgrenze“ trotzdem sperrt, ist nicht geprüft.
+- Neustarts, die ein Administrator oder ein Installer auslöst.
+
+### Ohne caffeinate: Bordmittel
+
+Diese Einstellungen hängen an keinem Prozess und gelten, bis man sie zurücknimmt:
+
+```powershell
+powercfg /change standby-timeout-ac 0    # am Netz nie Standby; zurück z. B. mit 30 (Minuten)
+powercfg /change monitor-timeout-ac 0    # Bildschirm bleibt an
+powercfg /requests                       # wer gerade Standby oder Bildschirm-Aus verhindert (Administrator)
+```
+
+Updates pausieren (bis zu fünf Wochen) und die Nutzungszeit (bis zu 18 Stunden) stellt man unter
+Einstellungen › Windows Update ein. Microsofts PowerToys enthalten mit „Awake“ ein Werkzeug, das
+den Rechner wach hält. Neustarts durch Updates hält es nicht auf.
+
+### Tests unter Windows
+
+`tests/windows.sh` läuft in Git Bash. Es prüft Optionen, Meldungen, Exit-Codes, den Start von
+Befehlen (Anführungszeichen, `.cmd` über PATHEXT), `-t` und `-w`. Als Administrator prüft es
+außerdem die Power Requests in `powercfg /requests` und `-r` in der Registry. Dazu gehören das
+Zurücksetzen nach Ende und nach `taskkill /F`, die Übergabe zwischen zwei `caffeinate -r` (auch
+wenn das erste gewaltsam endet), eine längere eigene Pause und eine während des Laufs geänderte
+Nutzungszeit. Bricht der Test ab, setzt er seine eigenen Änderungen zurück. Die CI baut die Binaries mit zig unter Linux und testet sie auf Windows x64 und
+ARM64 mit Administratorrechten.
+
 ## Tests
 
 `make test` startet drei Skripte:
@@ -288,6 +436,11 @@ und nach welchen Mustern es gebaut ist:
 
 Darauf folgen die Abschnitte Assertions, Helpers, D-Bus, X11, Power supply, Acquire and release und
 main, jeweils mit eigener Einleitung. Die Meldungen des Programms bleiben deutsch.
+
+`caffeinate_win.c` ist die Windows-Fassung mit demselben Aufbau. Eine Sperre ist ein Power Request,
+der an einem Handle hängt. Gewartet wird in einer einzigen `MsgWaitForMultipleObjects`-Schleife.
+`-r` ist mit Ablaufzeit, Sicherung und einem benannten Mutex als Sperre nachgebaut. `caffeinate.h`
+enthält, was beide teilen: die Assertion-Typen, die Usage-Zeile und das Einlesen der Optionen.
 
 ## Lizenz
 

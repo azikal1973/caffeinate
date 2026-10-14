@@ -4,7 +4,7 @@
 
 stdenv.mkDerivation {
   pname = "caffeinate";
-  version = "0.2.0.1";
+  version = "0.3.0.0";
 
   # only the sources, not a binary that may already sit in the working directory
   src = lib.fileset.toSource {
@@ -12,6 +12,7 @@ stdenv.mkDerivation {
     fileset = lib.fileset.unions [
       ./Makefile
       ./caffeinate.c
+      ./caffeinate.h
       ./caffeinate.8
       ./tests
     ];

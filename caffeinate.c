@@ -92,8 +92,10 @@
  *
  * READING GUIDE
  *
- *   Assertions           types, backend tables, per-assertion state
- *   Helpers              time, option parsing, UTF-8, fd hygiene
+ *   caffeinate.h         assertion types, usage, option parsing (shared
+ *                        with the Windows version, caffeinate_win.c)
+ *   Assertions           backend tables, per-assertion state
+ *   Helpers              time, UTF-8, fd hygiene
  *   D-Bus                wire format, connection, authentication, call()
  *   X11                  Xauthority, connection setup, screen saver suspend
  *   Power supply         on_ac_power() for -s
@@ -133,6 +135,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "caffeinate.h"
+
 /*
  * Older kernel headers (musl, RHEL 8) lack these syscall numbers. They are the
  * same on every architecture except alpha.
@@ -152,7 +156,6 @@
 # endif
 #endif
 
-#define NAME            "caffeinate"
 #define POWER_DIR       "/sys/class/power_supply"
 #define AC_POLL_MS      5000	/* -s: interval of the power supply check */
 #define PID_POLL_MS     1000	/* -w without pidfd (kernel < 5.3): interval of the pid check */
@@ -172,23 +175,9 @@ static bool debug;
 /* ---------------------------------------------------------------- Assertions */
 
 /*
- * An "assertion" (Apple's term) is one request to keep something awake. There
- * is one slot per type, that is per command line flag: -i, -d, -s, -u, -m.
+ * The assertion types (A_*) and their names are in caffeinate.h, shared with
+ * the Windows version.
  */
-enum { A_IDLE, A_DISPLAY, A_SYSTEM, A_USER, A_DISK, A_COUNT };
-
-/*
- * Names as Apple prints them, in the order of Apple's assertionMap. The order
- * matters: assertions are created in it, and the implicit 5 s timeout of -u
- * carries over to those after it (see create_assertions()).
- */
-static const char *const type_name[A_COUNT] = {
-	"PreventUserIdleSystemSleep",
-	"PreventUserIdleDisplaySleep",
-	"PreventSystemSleep",
-	"UserIsActive",
-	"PreventDiskIdle",
-};
 
 /*
  * A desktop service on the session bus that hands out inhibitor locks: calling
@@ -307,12 +296,6 @@ static int sys_pidfd_open(pid_t pid)
 	return (int)syscall(SYS_pidfd_open, pid, 0);
 }
 
-/* Apple's usage line, verbatim */
-static void usage(void)
-{
-	fprintf(stderr, "usage: caffeinate [-disu] [-t timeout] [-w Process ID] [command arguments...]\n");
-}
-
 /*
  * Remember why something failed, for the message to the user. Text from
  * services arrives unchecked, so control characters are replaced before it can
@@ -330,22 +313,6 @@ static void fail(const char *fmt, ...)
 		if (*p < 0x20 || *p == 0x7F)
 			*p = '?';
 	DBG("%s", reason);
-}
-
-/*
- * strtol(s, NULL, 0) with macOS semantics: there strtol sets errno = EINVAL
- * when it finds no digit; glibc and musl do not. Returns false in exactly the
- * cases where Apple's caffeinate calls usage().
- */
-static bool mac_strtol(const char *s, long *out)
-{
-	char *end;
-
-	errno = 0;
-	*out = strtol(s, &end, 0);
-	if (end == s)
-		errno = EINVAL;
-	return !(*out == 0 && errno != 0);
 }
 
 /*
@@ -2095,59 +2062,19 @@ static int die_by_signal(int sig, const sigset_t *oldmask)
  */
 int main(int argc, char **argv)
 {
-	bool want[A_COUNT] = { false };
-	long timeout = 0, waitforpid = 0;
+	struct options opt = { .want = { false } };
 	const char *env = getenv("CAFFEINATE_DEBUG");
-	int ch;
 
 	debug = env && *env && strcmp(env, "0") != 0;
 	for (int i = 0; i < A_COUNT; i++)
 		as[i].fd = as[i].xfd = -1;
 
-	/* '+': stop at the first non-option like BSD getopt, which leaves the
-	 * command's own flags alone; ':' and opterr = 0: print the messages in BSD
-	 * wording instead of glibc's or musl's */
-	opterr = 0;
-	while ((ch = getopt(argc, argv, "+:mdhisut:w:")) != -1) {
-		switch (ch) {
-		case 'm': want[A_DISK] = true; break;
-		case 'd': want[A_DISPLAY] = true; break;
-		case 'h': usage(); return EXIT_SUCCESS;
-		case 'i': want[A_IDLE] = true; break;
-		case 's': want[A_SYSTEM] = true; break;
-		case 'u': want[A_USER] = true; break;
-		case 'w':
-			if (!mac_strtol(optarg, &waitforpid)) {
-				usage();
-				return EXIT_FAILURE;
-			}
-			waitforpid = (pid_t)waitforpid;
-			break;
-		case 't':
-			if (!mac_strtol(optarg, &timeout)) {
-				usage();
-				return EXIT_FAILURE;
-			}
-			if (timeout < 0)	/* unsigned in Apple's code: practically infinite */
-				timeout = LONG_MAX;
-			break;
-		case ':':
-			fprintf(stderr, NAME ": option requires an argument -- %c\n", optopt);
-			usage();
-			return EXIT_FAILURE;
-		default:
-			fprintf(stderr, NAME ": illegal option -- %c\n", optopt);
-			usage();
-			return EXIT_FAILURE;
-		}
-	}
+	int status = parse_options(argc, argv, &opt);
+	if (status >= 0)
+		return status;
 
-	/* no assertion flag at all: -i is the default */
-	bool any = false;
-	for (int i = 0; i < A_COUNT; i++)
-		any |= want[i];
-	if (!any)
-		want[A_IDLE] = true;
+	const bool *want = opt.want;
+	long timeout = opt.timeout, waitforpid = opt.waitforpid;
 
 	/* the signals that end caffeinate are read from a signalfd in the event loop */
 	sigset_t mask, oldmask;
@@ -2159,13 +2086,13 @@ int main(int argc, char **argv)
 	int death_sig = 0;	/* command without pidfd: signal sent when the parent dies */
 	pid_t pid_poll = 0;	/* -w without pidfd: pid to check with kill(pid, 0) */
 	long long deadline = FOREVER;	/* when caffeinate itself ends (-t without command) */
-	bool have_cmd = argc - optind > 0;
+	bool have_cmd = argc - opt.cmd > 0;
 
 	if (have_cmd) {
 		/* Like Apple: fork early. The parent exec()s the command, so PID,
 		 * exit status and signals remain the command's own; the child
 		 * holds the assertions and watches over the parent. */
-		argv += optind;
+		argv += opt.cmd;
 		pid_t parent = getpid();
 		int self_fd = sys_pidfd_open(parent);	/* CLOEXEC by default */
 

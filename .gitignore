@@ -1,3 +1,5 @@
 caffeinate
 *.o
 *.plist
+*.exe
+*.pdb

@@ -86,10 +86,56 @@ jobs:
           path: caffeinate-${{ matrix.arch }}-linux
           if-no-files-found: error
 
+  # Windows binaries, cross-compiled with zig on Linux like from any other host.
+  windows-build:
+    name: Windows-Binaries (zig)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: zig 0.15.2 holen
+        run: |
+          curl -fsSLo zig.tar.xz https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+          echo "02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239  zig.tar.xz" | sha256sum -c -
+          tar -xJf zig.tar.xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"
+      - name: Bauen
+        run: make windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: caffeinate-windows
+          path: caffeinate-*-windows.exe
+          if-no-files-found: error
+
+  # ... and tested on Windows itself, x64 and ARM64. The runners are elevated,
+  # so tests/windows.sh also checks the power requests and -r.
+  windows-test:
+    name: Windows (${{ matrix.arch }})
+    needs: windows-build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-latest
+          - arch: aarch64
+            runner: windows-11-arm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: caffeinate-windows
+      - name: Testen
+        run: sh tests/windows.sh ./caffeinate-${{ matrix.arch }}-windows.exe
+
   # On a tag v*, attach the binaries to a release.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, static]
+    needs: [build, static, windows-test]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -102,7 +148,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           chmod +x caffeinate-*-linux
-          sha256sum caffeinate-*-linux > SHA256SUMS
+          sha256sum caffeinate-*-linux caffeinate-*-windows.exe > SHA256SUMS
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
-          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber caffeinate-*-linux SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber caffeinate-*-linux caffeinate-*-windows.exe SHA256SUMS
