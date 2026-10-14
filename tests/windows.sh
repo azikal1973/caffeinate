@@ -147,16 +147,20 @@ check "kill: Request weg" 0 "$(requests | grep -c 'caffeinate asserting')"
 POL='HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
 UX='HKLM\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
 STORE='HKLM\SOFTWARE\caffeinate\UpdateLease'
-snapshot() {	# the values -r touches, one per line
-	for v in SetActiveHours ActiveHoursStart ActiveHoursEnd; do
-		echo "$v=$(reg query "$POL" /v $v 2>/dev/null | crlf | awk -v v=$v '$1 == v { print $3 }')"
-	done
-	for v in PauseUpdatesStartTime PauseUpdatesExpiryTime PauseFeatureUpdatesStartTime \
-	         PauseFeatureUpdatesEndTime PauseQualityUpdatesStartTime PauseQualityUpdatesEndTime; do
-		echo "$v=$(reg query "$UX" /v $v 2>/dev/null | crlf | awk -v v=$v '$1 == v { print $3 }')"
-	done
+VALUES='SetActiveHours ActiveHoursStart ActiveHoursEnd PauseUpdatesStartTime PauseUpdatesExpiryTime
+PauseFeatureUpdatesStartTime PauseFeatureUpdatesEndTime PauseQualityUpdatesStartTime PauseQualityUpdatesEndTime'
+snapshot() {	# the values -r touches, one per line: two reg calls, so that it takes little time
+	{ reg query "$POL" 2>/dev/null; reg query "$UX" 2>/dev/null; } | crlf | awk -v names="$VALUES" '
+		/^HKEY/ { key = ($0 ~ /UX.Settings$/) ? "ux" : "pol"; next }	# UX has ActiveHours* of its own
+		{ v[key, $1] = $3 }
+		END {
+			n = split(names, k)
+			for (i = 1; i <= n; i++)
+				print k[i] "=" v[(i <= 3 ? "pol" : "ux"), k[i]]
+		}'
 }
-value() { snapshot | sed -n "s/^$1=//p"; }
+pick() { echo "$1" | sed -n "s/^$2=//p"; }	# snapshot, name
+value() { pick "$(snapshot)" "$1"; }
 has_store() { reg query "$STORE" >/dev/null 2>&1 && echo 1 || echo 0; }
 put_back() {	# every value as in $before
 	echo "$before" | while IFS== read -r v d; do
@@ -170,6 +174,10 @@ put_back() {	# every value as in $before
 	reg delete 'HKLM\SOFTWARE\caffeinate' /f >/dev/null 2>&1
 }
 
+# A run of caffeinate -r below lasts several seconds longer than the checks
+# made while it runs: reg.exe is slow to start, all the more in an elevated
+# MSYS2 shell. Each check during a run reads one snapshot taken at once.
+
 # a record left by an earlier run that was torn down: give its values back
 # first, or they would pass for the originals here
 if [ "$(has_store)" = 1 ]; then
@@ -178,13 +186,14 @@ if [ "$(has_store)" = 1 ]; then
 fi
 before=$(snapshot)
 restore=put_back
-"$C" -r -t 3 2>/dev/null &
+"$C" -r -t 8 2>/dev/null &
 sleep 1
-check "-r: SetActiveHours gesetzt" 0x1 "$(value SetActiveHours)"
+now=$(snapshot) store=$(has_store)
 hour=$(date +%H | sed 's/^0//')
-check "-r: Nutzungszeit beginnt eine Stunde vor jetzt" "0x$(printf %x $(( (hour + 23) % 24 )))" "$(value ActiveHoursStart)"
-check "-r: Pause bis morgen" "$(date -u -d tomorrow +%Y-%m-%d)" "$(value PauseUpdatesExpiryTime | cut -c1-10)"
-check "-r: Sicherung angelegt" 1 "$(has_store)"
+check "-r: SetActiveHours gesetzt" 0x1 "$(pick "$now" SetActiveHours)"
+check "-r: Nutzungszeit beginnt eine Stunde vor jetzt" "0x$(printf %x $(( (hour + 23) % 24 )))" "$(pick "$now" ActiveHoursStart)"
+check "-r: Pause bis morgen" "$(date -u -d tomorrow +%Y-%m-%d)" "$(pick "$now" PauseUpdatesExpiryTime | cut -c1-10)"
+check "-r: Sicherung angelegt" 1 "$store"
 wait
 check "-r: alte Werte wieder da" "$before" "$(snapshot)"
 check "-r: Sicherung geloescht" 0 "$(has_store)"
@@ -203,13 +212,14 @@ check "-r kill: Sicherung danach geloescht" 0 "$(has_store)"
 "$C" -r -t 2 2>/dev/null &
 first=$!
 sleep 1
-"$C" -r -t 4 2>/dev/null &
+"$C" -r -t 10 2>/dev/null &
 second=$!
 wait $first
 sleep 1
 # the first one has dropped its record; only a second that took over has one
-check "-r Uebergabe: der zweite haelt die Sperre" 1 "$(has_store)"
-check "-r Uebergabe: Nutzungszeit gesetzt" 0x1 "$(value SetActiveHours)"
+store=$(has_store) now=$(snapshot)
+check "-r Uebergabe: der zweite haelt die Sperre" 1 "$store"
+check "-r Uebergabe: Nutzungszeit gesetzt" 0x1 "$(pick "$now" SetActiveHours)"
 wait $second
 check "-r Uebergabe: danach alles zurueck" "$before" "$(snapshot)"
 
@@ -217,35 +227,40 @@ check "-r Uebergabe: danach alles zurueck" "$before" "$(snapshot)"
 "$C" -r -t 30 2>/dev/null &
 first=$!
 sleep 1
-"$C" -r -t 4 2>/dev/null &
+"$C" -r -t 10 2>/dev/null &
 second=$!
 sleep 1
 first_start=$(value PauseUpdatesStartTime)
+sleep 1		# the second one's start of the pause is a later second
 taskkill /F /PID "$(cat /proc/$first/winpid)" >/dev/null 2>&1
 wait $first
 sleep 1
 # the second one renews on taking over: a later start of the pause
+second_start=$(value PauseUpdatesStartTime)
 check "-r Uebernahme nach kill: der zweite hat erneuert" 1 \
-	"$([ -n "$(value PauseUpdatesStartTime)" ] && [ "$(value PauseUpdatesStartTime)" != "$first_start" ] && echo 1)"
+	"$([ -n "$second_start" ] && [ "$second_start" != "$first_start" ] && echo 1)"
 wait $second
 check "-r Uebernahme nach kill: danach alles zurueck" "$before" "$(snapshot)"
 
 # active hours changed during the run: the whole group stays as the user left it
-"$C" -r -t 3 2>/dev/null &
+"$C" -r -t 5 2>/dev/null &
 sleep 1
 reg add "$POL" /v ActiveHoursStart /t REG_DWORD /d 8 /f >/dev/null
 wait
-check "-r: geaenderte Nutzungszeit bleibt" 0x8 "$(value ActiveHoursStart)"
-check "-r: mit ihrer Gruppe" 0x1 "$(value SetActiveHours)"
+now=$(snapshot)
+check "-r: geaenderte Nutzungszeit bleibt" 0x8 "$(pick "$now" ActiveHoursStart)"
+check "-r: mit ihrer Gruppe" 0x1 "$(pick "$now" SetActiveHours)"
 check "-r: Sicherung trotzdem geloescht" 0 "$(has_store)"
 put_back
 
 # a longer pause of the user's own stays
 reg add "$UX" /v PauseUpdatesExpiryTime /t REG_SZ /d 2099-01-01T00:00:00Z /f >/dev/null
-"$C" -r -t 2 2>/dev/null &
+"$C" -r -t 8 2>/dev/null &
 sleep 1
-check "-r: laengere Pause des Nutzers bleibt waehrend des Laufs" 2099-01-01T00:00:00Z "$(value PauseUpdatesExpiryTime)"
-check "-r: ihr Beginn auch" "$(echo "$before" | sed -n 's/^PauseUpdatesStartTime=//p')" "$(value PauseUpdatesStartTime)"
+now=$(snapshot)
+check "-r: laengere Pause des Nutzers bleibt waehrend des Laufs" 2099-01-01T00:00:00Z "$(pick "$now" PauseUpdatesExpiryTime)"
+check "-r: ihr Beginn auch" "$(pick "$before" PauseUpdatesStartTime)" "$(pick "$now" PauseUpdatesStartTime)"
+check "-r: aber die Nutzungszeit gesetzt" 0x1 "$(pick "$now" SetActiveHours)"
 wait
 check "-r: laengere Pause des Nutzers bleibt danach" 2099-01-01T00:00:00Z "$(value PauseUpdatesExpiryTime)"
 put_back
